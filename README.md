@@ -8,7 +8,7 @@ A set of public utility scripts
 
 - _sb-analyze.py_ - Analyze and aggregate messages going through the Azure Service Bus.
 
-- _mapping-analyze.py_ - Analyze Elastic Search index mappings
+- _mapping-analyze.py_ - Analyze Elastic Search index mappings.
 
 - _json2csv.py_ - Convert multiple JSON files (in a ZIP or a nested directory structure) to a single CSV file.
 
