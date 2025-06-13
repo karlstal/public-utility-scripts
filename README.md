@@ -1,14 +1,22 @@
 # public-utility-scripts
 
-A set of public utility scripts
+A collection of utility scripts for various system and data analysis tasks.
 
-## Scripts
+## Contents
 
-- _http-deps.sh_ - Check outgoing http connections from a linux container.
+### Scripts
 
-- _sb-analyze.py_ - Analyze and aggregate messages going through the Azure Service Bus.
+- **`http-deps.sh`**  
+  Checks outgoing HTTP connections from a Linux container.  
+  Useful for investigating SNAT port exhaustion.
 
-- _mapping-analyze.py_ - Analyze Elastic Search index mappings.
+- **`sb-analyze.py`**  
+  Analyzes and aggregates messages passing through Azure Service Bus.
+  Useful for investigating service bus congestion.
 
-- _json2csv.py_ - Convert multiple JSON files (in a ZIP or a nested directory structure) to a single CSV file.
+- **`mapping-analyze.py`**  
+  Analyzes Elasticsearch index mappings.
 
+- **`json2csv.py`**  
+  Converts multiple JSON files into a single CSV file.  
+  Supports ZIP files and nested directory structures.
