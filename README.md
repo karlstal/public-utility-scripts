@@ -21,6 +21,6 @@ A collection of utility scripts for various system and data analysis tasks.
   Converts multiple JSON files into a single CSV file.  
   Supports ZIP files and nested directory structures.
 
-  - **`mapping-depth.py`**  
+- **`mapping-depth.py`**  
   Analyze depth in S&N mappings. Useful for investigating deeply nested structures.
 
