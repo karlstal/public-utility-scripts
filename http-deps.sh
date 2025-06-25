@@ -1,11 +1,3 @@
-#!/bin/bash
-
-# Run the following command to download this script and make it executable:
-# curl -s https://raw.githubusercontent.com/karlstal/public-utility-scripts/refs/heads/main/http-deps.sh -o http-deps.sh && chmod +x http-deps.sh
-# When done is can be run as follows:
-# ./http-deps.sh
-
- 
 # Script for polling current connections, excluding incoming connections
 # on ports 80, 443, and 2222, but including outgoing connections to those ports.
 # This script focuses on readability, correct data presentation, and IPv6 support.
@@ -25,6 +17,13 @@ for arg in "$@"; do
         GROUP_BY_PID=1
     fi
 done
+
+# Set sort command
+if [[ $GROUP_BY_PID -eq 1 ]]; then
+    SORT_CMD='sort -k3,3nr'
+else
+    SORT_CMD='sort -k2,2nr'
+fi
 
 while true; do
     echo "Polling current connections, specifically excluding incoming connections on ports 80, 443, and 2222..."
@@ -70,7 +69,7 @@ while true; do
             else
                 printf "%-45s %-8d %s\n", remote_addr, remote_addr_pid_total[key], states[key];
         }
-    }' | sort -k3,3nr
+    }' | eval "$SORT_CMD"
     echo "--------------------------------------------------------------------------------"
     echo "Poll complete. Waiting for 10 seconds..."
     sleep 10
