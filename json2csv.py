@@ -28,7 +28,7 @@ LOG_LEVELS = {
 }
 
 # Function to extract specified columns from a log line
-def extract_data(log_line, loglevel):
+def extract_data(log_line, loglevel, verbose=False):
     match = re.search(r'{.*}', log_line)
     if match:
         try:
@@ -41,8 +41,15 @@ def extract_data(log_line, loglevel):
                     transformed_value = column["transform"](value)
                     extracted_data[column["csv_name"]] = transformed_value
                 return extracted_data
-        except json.JSONDecodeError:
-            return None
+            else:
+                if verbose:
+                    print(f"Skipping line due to log level: {log_level}")
+        except json.JSONDecodeError as e:
+            if verbose:
+                print(f"Failed to decode JSON: {e}\nLine: {log_line.strip()}")
+    else:
+        if verbose:
+            print(f"No JSON object found in line: {log_line.strip()}")
     return None
 
 # Function to process a single JSON file
@@ -50,36 +57,43 @@ def process_json_file(file_path, writers, verbose, base_path, loglevel, separate
     if verbose:
         relative_path = compact_path(file_path, base_path)
         print(f"Processing file: {relative_path}")
-    
+
+    total_lines = 0
+    written_lines = 0
+
     with open(file_path, 'r', encoding='utf-8') as file:
         for line in file:
-            extracted_data = extract_data(line, "debug")
+            total_lines += 1
+            extracted_data = extract_data(line, loglevel, verbose)
             if extracted_data:
+                written_lines += 1
                 host = extracted_data["Host"]
                 if separated:
                     writer = writers.get(host)
                     if not writer:
-                        writer = create_csv_writer(host, file_path, separated)
+                        writer = create_csv_writer(host, base_path, separated)
                         writers[host] = writer
                     writer.writerow(extracted_data)
                 else:
-                    # In single CSV mode, write to the common file
                     writers['common'].writerow(extracted_data)
 
+    if verbose:
+        print(f"Finished file: {file_path} — Total lines: {total_lines}, Written: {written_lines}, Skipped: {total_lines - written_lines}")
+
 # Function to create a new CSV writer for a specific host
-def create_csv_writer(host, file_path, separated):
-    output_file = f"{host}.csv" if separated else file_path
+def create_csv_writer(host, base_path, separated):
+    output_file = f"{host}.csv" if separated else base_path
     fieldnames = [column["csv_name"] for column in columns]
-    mode = 'w' if not os.path.exists(output_file) else 'a'
-    
+    mode = 'a' if os.path.exists(output_file) else 'w'
+
     csvfile = open(output_file, mode, newline='', encoding='utf-8')
     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-    
-    if not os.path.exists(output_file):
+
+    if mode == 'w':
         writer.writeheader()  # Write header if it's a new file
-    
+
     print(f"Output path: {output_file}")
-    
+
     return writer
 
 # Function to process all files in a directory recursively
@@ -91,8 +105,8 @@ def process_directory(directory, writers, verbose, base_path, loglevel, separate
         dirs.sort()
         files.sort()
         for file in files:
-            if file.endswith('.json'):
-                file_path = os.path.join(root, file)
+            file_path = os.path.join(root, file)
+            if looks_like_json_file(file_path):
                 process_json_file(file_path, writers, verbose, base_path, loglevel, separated)
 
 # Helper function to compact the paths
@@ -104,6 +118,19 @@ def compact_path(path, base_path):
     if len(directories) > MAX_DEPTH:
         directories = ['...'] + directories[-MAX_DEPTH:]
     return os.sep.join(directories + [filename])
+
+def looks_like_json_file(file_path, lines_to_check=5):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for _ in range(lines_to_check):
+                line = f.readline()
+                if not line:
+                    break
+                if re.search(r'{.*}', line.strip()):
+                    return True
+    except Exception:
+        pass  # Optionally log if verbose
+    return False
 
 # Function to handle .ZIP files
 def process_zip_file(zip_path, writers, verbose, base_path, loglevel, separated):
@@ -119,13 +146,13 @@ def process_input(input_path, output_file, delimiter, verbose, loglevel, separat
     base_path = os.getcwd()
     input_path = os.path.abspath(input_path)
     output_file = os.path.abspath(output_file)
-    
+
     if verbose:
         print(f"Input path: {compact_path(input_path, base_path)}")
         print(f"Output path: {compact_path(output_file, base_path)}")
-    
+
     writers = {}  # Dictionary to hold CSV writers for each host
-    
+
     if separated:
         # Process the directory or file and create separate files per host
         if os.path.isdir(input_path):
@@ -133,10 +160,10 @@ def process_input(input_path, output_file, delimiter, verbose, loglevel, separat
         elif os.path.isfile(input_path):
             if input_path.lower().endswith('.zip'):
                 process_zip_file(input_path, writers, verbose, base_path, loglevel, separated)
-            elif input_path.lower().endswith('.json'):
+            elif looks_like_json_file(input_path):
                 process_json_file(input_path, writers, verbose, base_path, loglevel, separated)
             else:
-                raise ValueError("The input file must have a .json or .zip extension.")
+                raise ValueError("The input file must be a JSON or ZIP file.")
         else:
             raise ValueError(f"The provided path '{input_path}' is neither a directory nor a file.")
     else:
@@ -145,16 +172,16 @@ def process_input(input_path, output_file, delimiter, verbose, loglevel, separat
             fieldnames = [column["csv_name"] for column in columns]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter=delimiter)
             writer.writeheader()
-            
+
             if os.path.isdir(input_path):
                 process_directory(input_path, {'common': writer}, verbose, base_path, loglevel, separated)
             elif os.path.isfile(input_path):
                 if input_path.lower().endswith('.zip'):
                     process_zip_file(input_path, {'common': writer}, verbose, base_path, loglevel, separated)
-                elif input_path.lower().endswith('.json'):
+                elif looks_like_json_file(input_path):
                     process_json_file(input_path, {'common': writer}, verbose, base_path, loglevel, separated)
                 else:
-                    raise ValueError("The input file must have a .json or .zip extension.")
+                    raise ValueError("The input file must be a JSON or ZIP file.")
             else:
                 raise ValueError(f"The provided path '{input_path}' is neither a directory nor a file.")
 
@@ -190,7 +217,7 @@ def main():
         ),
     )
     parser.add_argument(
-        "--separated", 
+        "--separated",
         action="store_true",
         help="Whether to generate separate files for each host.",
     )
