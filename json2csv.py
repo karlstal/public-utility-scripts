@@ -78,7 +78,7 @@ def process_json_file(file_path, writers, verbose, base_path, loglevel, separate
                     writers['common'].writerow(extracted_data)
 
     if verbose:
-        print(f"Finished file: {file_path} — Total lines: {total_lines}, Written: {written_lines}, Skipped: {total_lines - written_lines}")
+        print(f"Finished file: {compact_path(file_path, base_path)} — Total lines: {total_lines}, Written: {written_lines}, Skipped: {total_lines - written_lines}")
 
 # Function to create a new CSV writer for a specific host
 def create_csv_writer(host, base_path, separated):
