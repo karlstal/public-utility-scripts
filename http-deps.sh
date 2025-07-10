@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# Run the following command to download this script and make it executable:
+# curl -s https://raw.githubusercontent.com/karlstal/public-utility-scripts/refs/heads/main/http-deps.sh -o http-deps.sh && chmod +x http-deps.sh
+# When done is can be run as follows:
+# ./http-deps.sh
+
 # Script for polling current connections, excluding incoming connections
 # on ports 80, 443, and 2222, but including outgoing connections to those ports.
 
