@@ -12,7 +12,7 @@ MAX_DEPTH = 4
 # Array to define the columns you want to extract and their JSON keys
 columns = [
     {"csv_name": "Date", "json_key": "time", "transform": lambda x: x},
-    {"csv_name": "ResultDescription", "json_key": "resultDescription", "transform": lambda x: x.strip() if x else ""},
+    {"csv_name": "ResultDescription", "json_key": "resultDescription", "transform": lambda x: x.replace("\n", " ").replace("\r", " ").strip() if x else ""},
     {"csv_name": "Host", "json_key": "Host", "transform": lambda x: x},
     {"csv_name": "Level", "json_key": "level", "transform": lambda x: x},
     {"csv_name": "Container Id", "json_key": "containerId", "transform": lambda x: x},
