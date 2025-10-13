@@ -5,6 +5,7 @@ import re
 import argparse
 import zipfile
 import tempfile
+from datetime import datetime
 
 # Constants
 MAX_DEPTH = 4
@@ -52,30 +53,59 @@ def extract_data(log_line, loglevel, verbose=False):
             print(f"No JSON object found in line: {log_line.strip()}")
     return None
 
-# Function to process a single JSON file
+def parse_timestamp(ts: str):
+    if not ts:
+        return None
+    try:
+        # Remove the Z and limit fractional seconds to 6 digits
+        ts = ts.replace("Z", "+00:00")
+        ts = re.sub(r'(\.\d{6})\d+', r'\1', ts)  # trim to microseconds
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
+    
 def process_json_file(file_path, writers, verbose, base_path, loglevel, separated):
     if verbose:
-        relative_path = compact_path(file_path, base_path)
-        print(f"Processing file: {relative_path}")
+        print(f"Processing file: {compact_path(file_path, base_path)}")
 
     total_lines = 0
     written_lines = 0
+    empty_row = {col["csv_name"]: "" for col in columns}
+    prevDate = None
 
+    # Step 1: read all lines and extract data
+    extracted_rows = []
     with open(file_path, 'r', encoding='utf-8') as file:
         for line in file:
             total_lines += 1
             extracted_data = extract_data(line, loglevel, verbose)
             if extracted_data:
+                # parse timestamp for sorting
+                extracted_data["_parsedDate"] = parse_timestamp(extracted_data["Date"])
+                extracted_rows.append(extracted_data)
                 written_lines += 1
-                host = extracted_data["Host"]
-                if separated:
-                    writer = writers.get(host)
-                    if not writer:
-                        writer = create_csv_writer(host, base_path, separated)
-                        writers[host] = writer
-                    writer.writerow(extracted_data)
-                else:
-                    writers['common'].writerow(extracted_data)
+
+    # Step 2: sort by timestamp
+    extracted_rows.sort(key=lambda x: x["_parsedDate"] if x["_parsedDate"] else datetime.min)
+
+    # Step 3: write sorted rows, inserting empty rows if gap > 100ms
+    for row in extracted_rows:
+        curDate = row["_parsedDate"]
+
+        if not separated:
+            if curDate and prevDate:
+                diff_ms = (curDate - prevDate).total_seconds() * 1000
+                if diff_ms > 50:
+                    writers['common'].writerow(empty_row)
+            prevDate = curDate
+            writers['common'].writerow({k: v for k, v in row.items() if k != "_parsedDate"})
+        else:
+            host = row["Host"]
+            writer = writers.get(host)
+            if not writer:
+                writer = create_csv_writer(host, base_path, separated)
+                writers[host] = writer
+            writer.writerow({k: v for k, v in row.items() if k != "_parsedDate"})
 
     if verbose:
         print(f"Finished file: {compact_path(file_path, base_path)} — Total lines: {total_lines}, Written: {written_lines}, Skipped: {total_lines - written_lines}")
