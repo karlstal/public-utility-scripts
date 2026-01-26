@@ -1,3 +1,25 @@
+#INSTRUCTIONS
+# Download script
+# curl -L -o /home/site/wwwroot/monitor-memory_dump.sh https://raw.githubusercontent.com/karlstal/public-utility-scripts/main/monitor-memory_dump.sh
+
+#change permissions to allow running as executable
+# chmod +x /home/site/wwwroot/monitor-memory_dump.sh
+
+# cd /home/site/wwwroot
+
+# Get PID of dotnet process
+# ps aux | grep dotnet
+
+
+# This starts the script in the background (nohup ending in & does this)
+# nohup bash /home/site/wwwroot/monitor-memory_dump.sh --pid 39 --threshold 87 --run-once \
+# > /home/LogFiles/AS/monitor.log 2>&1 &
+
+
+# To stop the script run this. 
+# /home/site/wwwroot/monitor-memory_dump.sh --stop
+
+# Once dump is complete, download it from the LogFiles/AS folder path in the azure app service file manager (accessible with /newui path). 
 
 #!/usr/bin/env bash
 set -u
