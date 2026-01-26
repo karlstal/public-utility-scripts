@@ -1,18 +1,6 @@
 
 #!/bin/bash
 
-# INSTRUCTIONS 
-
-# Download script
-# curl -L \
-#  -o /home/site/wwwroot/monitor-memory_dump.sh \
-#  https://raw.githubusercontent.com/karlstal/public-utility-scripts/main/monitor-memory_dump.sh
-
-# Get PID
-# ps aux | grep dotnet
-# Then run command with updated PID and desired memory percentage. 
-#./monitor-memory_dump.sh --pid 1234 --threshold 85 --run-once
-
 # ----------------------------
 # Default Values
 # ----------------------------
@@ -94,4 +82,3 @@ while true; do
 
     sleep 10
 done
-
