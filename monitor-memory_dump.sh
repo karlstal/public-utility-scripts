@@ -32,6 +32,9 @@ TARGET_PID=""
 RUN_ONCE=false
 STOP=false
 
+# Path to dotnet-dump executable; override if needed
+DOTNET_DUMP_CMD="/tools/dotnet-dump"
+
 PIDFILE="/tmp/memory-monitor.pid"
 DUMP_DIR="/home/LogFiles/AS"
 SLEEP_SECONDS=10
@@ -41,6 +44,9 @@ usage() {
 Usage:
   Start monitoring:
     $0 --pid <dotnet_pid> [--threshold <percent>] [--run-once]
+
+  If dotnet-dump is not in your PATH, set DOTNET_DUMP_CMD in the script or
+  make sure the executable exists at /tools/dotnet-dump.
 
   Stop monitoring (kills the background monitor started earlier):
     $0 --stop
@@ -147,6 +153,12 @@ trap cleanup EXIT INT TERM
 # ----------------------------
 mkdir -p "$DUMP_DIR"
 
+# verify dotnet-dump executable
+if [[ ! -x "$DOTNET_DUMP_CMD" ]]; then
+  echo "Error: dotnet-dump not found or not executable at $DOTNET_DUMP_CMD"
+  exit 1
+fi
+
 echo "Monitoring target PID $TARGET_PID with memory threshold ${THRESHOLD}%..."
 echo "Monitor PID: $$"
 echo "Dump directory: $DUMP_DIR"
@@ -171,7 +183,7 @@ while true; do
     DUMP_PATH="$DUMP_DIR/dump_${TARGET_PID}_${TIMESTAMP}.dmp"
 
     echo "Threshold exceeded: ${PERCENT}% (PID $TARGET_PID). Creating dump at ${DUMP_PATH}..."
-    dotnet-dump collect -p "$TARGET_PID" -o "$DUMP_PATH"
+    "$DOTNET_DUMP_CMD" collect -p "$TARGET_PID" -o "$DUMP_PATH"
     echo "Dump complete."
 
     if [[ "$RUN_ONCE" == true ]]; then
