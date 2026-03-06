@@ -1,9 +1,9 @@
 #INSTRUCTIONS
 # Download script
-# curl -L -o /home/site/wwwroot/monitor-memory_dump.sh https://raw.githubusercontent.com/karlstal/public-utility-scripts/main/monitor-memory_dump.sh
+# curl -L -o /home/site/wwwroot/memory-dump-threshold.sh https://raw.githubusercontent.com/karlstal/public-utility-scripts/main/memory-dump-threshold.sh
 
 #change permissions to allow running as executable
-# chmod +x /home/site/wwwroot/monitor-memory_dump.sh
+# chmod +x /home/site/wwwroot/memory-dump-threshold.sh
 
 # cd /home/site/wwwroot
 
@@ -12,12 +12,12 @@
 
 
 # This starts the script in the background (nohup ending in & does this)
-# nohup bash /home/site/wwwroot/monitor-memory_dump.sh --pid 39 --threshold 87 --run-once \
+# nohup bash /home/site/wwwroot/memory-dump-threshold.sh --pid 39 --threshold 87 --run-once \
 # > /home/LogFiles/AS/monitor.log 2>&1 &
 
 
 # To stop the script run this. 
-# /home/site/wwwroot/monitor-memory_dump.sh --stop
+# /home/site/wwwroot/memory-dump-threshold.sh --stop
 
 # Once dump is complete, download it from the LogFiles/AS folder path in the azure app service file manager (accessible with /newui path). 
 
@@ -31,6 +31,10 @@ THRESHOLD=85
 TARGET_PID=""
 RUN_ONCE=false
 STOP=false
+THREAD_THRESHOLD=""
+
+# Path to dotnet-dump executable; override if needed
+DOTNET_DUMP_CMD="/tools/dotnet-dump"
 
 PIDFILE="/tmp/memory-monitor.pid"
 DUMP_DIR="/home/LogFiles/AS"
@@ -40,13 +44,17 @@ usage() {
   cat <<EOF
 Usage:
   Start monitoring:
-    $0 --pid <dotnet_pid> [--threshold <percent>] [--run-once]
+    $0 --pid <dotnet_pid> [--threshold <percent>] [--thread-threshold <count>] [--run-once]
+
+  If dotnet-dump is not in your PATH, set DOTNET_DUMP_CMD in the script or
+  make sure the executable exists at /tools/dotnet-dump.
 
   Stop monitoring (kills the background monitor started earlier):
     $0 --stop
 
 Examples:
   nohup $0 --pid 1234 --threshold 87 --run-once > /home/LogFiles/AS/monitor.log 2>&1 &
+  nohup $0 --pid 1234 --thread-threshold 100 > /home/LogFiles/AS/monitor.log 2>&1 &
   $0 --stop
 EOF
 }
@@ -58,6 +66,7 @@ while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --threshold) THRESHOLD="$2"; shift ;;
     --pid) TARGET_PID="$2"; shift ;;
+    --thread-threshold) THREAD_THRESHOLD="$2"; shift ;;
     --run-once) RUN_ONCE=true ;;
     --stop) STOP=true ;;
     --help|-h) usage; exit 0 ;;
@@ -147,7 +156,14 @@ trap cleanup EXIT INT TERM
 # ----------------------------
 mkdir -p "$DUMP_DIR"
 
+# verify dotnet-dump executable
+if [[ ! -x "$DOTNET_DUMP_CMD" ]]; then
+  echo "Error: dotnet-dump not found or not executable at $DOTNET_DUMP_CMD"
+  exit 1
+fi
+
 echo "Monitoring target PID $TARGET_PID with memory threshold ${THRESHOLD}%..."
+[[ -n "$THREAD_THRESHOLD" ]] && echo "Thread threshold: ${THREAD_THRESHOLD}"
 echo "Monitor PID: $$"
 echo "Dump directory: $DUMP_DIR"
 echo "PID file: $PIDFILE"
@@ -166,12 +182,27 @@ while true; do
   USED=$(grep VmRSS /proc/"$TARGET_PID"/status | awk '{print $2}')
   PERCENT=$((100 * USED / TOTAL))
 
+  DUMP_TRIGGERED=false
+
   if [[ "$PERCENT" -ge "$THRESHOLD" ]]; then
+    echo "Memory threshold exceeded: ${PERCENT}% (PID $TARGET_PID)."
+    DUMP_TRIGGERED=true
+  fi
+
+  if [[ -n "$THREAD_THRESHOLD" ]]; then
+    THREADS=$(grep Threads /proc/"$TARGET_PID"/status | awk '{print $2}')
+    if [[ "$THREADS" -ge "$THREAD_THRESHOLD" ]]; then
+      echo "Thread threshold exceeded: ${THREADS} threads (PID $TARGET_PID)."
+      DUMP_TRIGGERED=true
+    fi
+  fi
+
+  if [[ "$DUMP_TRIGGERED" == true ]]; then
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     DUMP_PATH="$DUMP_DIR/dump_${TARGET_PID}_${TIMESTAMP}.dmp"
 
-    echo "Threshold exceeded: ${PERCENT}% (PID $TARGET_PID). Creating dump at ${DUMP_PATH}..."
-    dotnet-dump collect -p "$TARGET_PID" -o "$DUMP_PATH"
+    echo "Creating dump at ${DUMP_PATH}..."
+    "$DOTNET_DUMP_CMD" collect -p "$TARGET_PID" -o "$DUMP_PATH"
     echo "Dump complete."
 
     if [[ "$RUN_ONCE" == true ]]; then
