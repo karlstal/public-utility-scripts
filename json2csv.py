@@ -10,17 +10,25 @@ from datetime import datetime
 # Constants
 MAX_DEPTH = 4
 
-# Array to define the columns you want to extract and their JSON keys
+# Columns to extract
 columns = [
-    {"csv_name": "Date", "json_key": "time", "transform": lambda x: x},
-    {"csv_name": "ResultDescription", "json_key": "resultDescription", "transform": lambda x: x.replace("\n", " ").replace("\r", " ").strip() if x else ""},
+    {
+        "csv_name": "Date",
+        "json_key": "time",
+        "transform": lambda x: x if x else ""
+    },
+    {
+        "csv_name": "ResultDescription",
+        "json_key": "resultDescription",
+        "transform": lambda x: x.replace("\n", " ").replace("\r", " ").strip() if x else ""
+    },
     {"csv_name": "Host", "json_key": "Host", "transform": lambda x: x},
     {"csv_name": "Level", "json_key": "level", "transform": lambda x: x},
     {"csv_name": "Container Id", "json_key": "containerId", "transform": lambda x: x},
     {"csv_name": "Operation Name", "json_key": "operationName", "transform": lambda x: x},
 ]
 
-# Define log levels and their hierarchy
+# Log levels
 LOG_LEVELS = {
     "error": 1,
     "warning": 2,
@@ -28,91 +36,111 @@ LOG_LEVELS = {
     "debug": 4,
 }
 
-# Function to extract specified columns from a log line
 def extract_data(log_line, loglevel, verbose=False):
     match = re.search(r'{.*}', log_line)
-    if match:
-        try:
-            log_data = json.loads(match.group(0))
-            log_level = log_data.get("level", "").lower()
-            if LOG_LEVELS.get(log_level, 0) <= LOG_LEVELS.get(loglevel, 0):
-                extracted_data = {}
-                for column in columns:
-                    value = log_data.get(column["json_key"], "")
-                    transformed_value = column["transform"](value)
-                    extracted_data[column["csv_name"]] = transformed_value
-                return extracted_data
-            else:
-                if verbose:
-                    print(f"Skipping line due to log level: {log_level}")
-        except json.JSONDecodeError as e:
-            if verbose:
-                print(f"Failed to decode JSON: {e}\nLine: {log_line.strip()}")
-    else:
+    if not match:
         if verbose:
             print(f"No JSON object found in line: {log_line.strip()}")
-    return None
+        return None
 
-def parse_timestamp(ts: str):
+    try:
+        log_data = json.loads(match.group(0))
+        log_level = log_data.get("level", "").lower()
+
+        if LOG_LEVELS.get(log_level, 0) > LOG_LEVELS.get(loglevel, 0):
+            if verbose:
+                print(f"Skipping line due to log level: {log_level}")
+            return None
+
+        extracted = {}
+        for column in columns:
+            value = log_data.get(column["json_key"], "")
+            extracted[column["csv_name"]] = column["transform"](value)
+
+        return extracted
+
+    except json.JSONDecodeError as e:
+        if verbose:
+            print(f"Failed to decode JSON: {e}\nLine: {log_line.strip()}")
+        return None
+
+
+def parse_timestamp(ts: str, convert_to_local: bool):
     if not ts:
         return None
     try:
-        # Remove the Z and limit fractional seconds to 6 digits
         ts = ts.replace("Z", "+00:00")
         ts = re.sub(r'(\.\d{6})\d+', r'\1', ts)  # trim to microseconds
-        return datetime.fromisoformat(ts)
+        dt = datetime.fromisoformat(ts)
+
+        if convert_to_local and dt.tzinfo is not None:
+            dt = dt.astimezone()
+
+        return dt
     except Exception:
         return None
-    
-def process_json_file(file_path, writers, verbose, base_path, loglevel, separated):
+
+
+def process_json_file(
+    file_path, writers, verbose, base_path,
+    loglevel, separated, localtime
+):
     if verbose:
         print(f"Processing file: {compact_path(file_path, base_path)}")
 
     total_lines = 0
     written_lines = 0
     empty_row = {col["csv_name"]: "" for col in columns}
-    prevDate = None
-
-    # Step 1: read all lines and extract data
+    prev_date = None
     extracted_rows = []
+
     with open(file_path, 'r', encoding='utf-8') as file:
         for line in file:
             total_lines += 1
-            extracted_data = extract_data(line, loglevel, verbose)
-            if extracted_data:
-                # parse timestamp for sorting
-                extracted_data["_parsedDate"] = parse_timestamp(extracted_data["Date"])
-                extracted_rows.append(extracted_data)
+            data = extract_data(line, loglevel, verbose)
+            if data:
+                data["_parsedDate"] = parse_timestamp(data["Date"], localtime)
+                extracted_rows.append(data)
                 written_lines += 1
 
-    # Step 2: sort by timestamp
-    extracted_rows.sort(key=lambda x: x["_parsedDate"] if x["_parsedDate"] else datetime.min)
+    extracted_rows.sort(
+        key=lambda x: x["_parsedDate"] if x["_parsedDate"] else datetime.min
+    )
 
-    # Step 3: write sorted rows, inserting empty rows if gap > 100ms
     for row in extracted_rows:
-        curDate = row["_parsedDate"]
+        cur_date = row["_parsedDate"]
 
         if not separated:
-            if curDate and prevDate:
-                diff_ms = (curDate - prevDate).total_seconds() * 1000
+            if cur_date and prev_date:
+                diff_ms = (cur_date - prev_date).total_seconds() * 1000
                 if diff_ms > 50:
-                    writers['common'].writerow(empty_row)
-            prevDate = curDate
-            writers['common'].writerow({k: v for k, v in row.items() if k != "_parsedDate"})
+                    writers["common"].writerow(empty_row)
+
+            prev_date = cur_date
+            writers["common"].writerow(
+                {k: v for k, v in row.items() if k != "_parsedDate"}
+            )
         else:
             host = row["Host"]
             writer = writers.get(host)
             if not writer:
-                writer = create_csv_writer(host, base_path, separated)
+                writer = create_csv_writer(host, base_path)
                 writers[host] = writer
-            writer.writerow({k: v for k, v in row.items() if k != "_parsedDate"})
+
+            writer.writerow(
+                {k: v for k, v in row.items() if k != "_parsedDate"}
+            )
 
     if verbose:
-        print(f"Finished file: {compact_path(file_path, base_path)} — Total lines: {total_lines}, Written: {written_lines}, Skipped: {total_lines - written_lines}")
+        print(
+            f"Finished file: {compact_path(file_path, base_path)} — "
+            f"Total: {total_lines}, Written: {written_lines}, "
+            f"Skipped: {total_lines - written_lines}"
+        )
 
-# Function to create a new CSV writer for a specific host
-def create_csv_writer(host, base_path, separated):
-    output_file = f"{host}.csv" if separated else base_path
+
+def create_csv_writer(host, base_path):
+    output_file = f"{host}.csv"
     fieldnames = [column["csv_name"] for column in columns]
     mode = 'a' if os.path.exists(output_file) else 'w'
 
@@ -120,147 +148,139 @@ def create_csv_writer(host, base_path, separated):
     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
     if mode == 'w':
-        writer.writeheader()  # Write header if it's a new file
+        writer.writeheader()
 
     print(f"Output path: {output_file}")
-
     return writer
 
-# Function to process all files in a directory recursively
-def process_directory(directory, writers, verbose, base_path, loglevel, separated):
+
+def process_directory(directory, writers, verbose, base_path, loglevel, separated, localtime):
     if verbose:
-        relative_path = compact_path(directory, base_path)
-        print(f"Processing directory: {relative_path}")
+        print(f"Processing directory: {compact_path(directory, base_path)}")
+
     for root, dirs, files in os.walk(directory):
         dirs.sort()
         files.sort()
         for file in files:
             file_path = os.path.join(root, file)
             if looks_like_json_file(file_path):
-                process_json_file(file_path, writers, verbose, base_path, loglevel, separated)
+                process_json_file(
+                    file_path, writers, verbose, base_path,
+                    loglevel, separated, localtime
+                )
 
-# Helper function to compact the paths
+
+def process_zip_file(zip_path, writers, verbose, base_path, loglevel, separated, localtime):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
+            if verbose:
+                print(f"Extracted ZIP to: {temp_dir}")
+
+            process_directory(
+                temp_dir, writers, verbose, base_path,
+                loglevel, separated, localtime
+            )
+
+
 def compact_path(path, base_path):
-    relative_path = os.path.relpath(path, base_path)
-    path_parts = relative_path.split(os.sep)
-    filename = path_parts[-1]
-    directories = path_parts[:-1]
-    if len(directories) > MAX_DEPTH:
-        directories = ['...'] + directories[-MAX_DEPTH:]
-    return os.sep.join(directories + [filename])
+    relative = os.path.relpath(path, base_path)
+    parts = relative.split(os.sep)
+    if len(parts) > MAX_DEPTH:
+        parts = ['...'] + parts[-MAX_DEPTH:]
+    return os.sep.join(parts)
+
 
 def looks_like_json_file(file_path, lines_to_check=5):
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             for _ in range(lines_to_check):
-                line = f.readline()
-                if not line:
-                    break
-                if re.search(r'{.*}', line.strip()):
+                if re.search(r'{.*}', f.readline()):
                     return True
     except Exception:
-        pass  # Optionally log if verbose
+        pass
     return False
 
-# Function to handle .ZIP files
-def process_zip_file(zip_path, writers, verbose, base_path, loglevel, separated):
-    with tempfile.TemporaryDirectory() as temp_dir:
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
-            if verbose:
-                print(f"Extracted ZIP file to temporary directory: {temp_dir}")
-            process_directory(temp_dir, writers, verbose, base_path, loglevel, separated)
 
-# Function to handle both directory and file inputs
-def process_input(input_path, output_file, delimiter, verbose, loglevel, separated):
+def process_input(
+    input_path, output_file, delimiter,
+    verbose, loglevel, separated, localtime
+):
     base_path = os.getcwd()
     input_path = os.path.abspath(input_path)
     output_file = os.path.abspath(output_file)
 
-    if verbose:
-        print(f"Input path: {compact_path(input_path, base_path)}")
-        print(f"Output path: {compact_path(output_file, base_path)}")
-
-    writers = {}  # Dictionary to hold CSV writers for each host
+    writers = {}
 
     if separated:
-        # Process the directory or file and create separate files per host
         if os.path.isdir(input_path):
-            process_directory(input_path, writers, verbose, base_path, loglevel, separated)
+            process_directory(input_path, writers, verbose, base_path, loglevel, separated, localtime)
         elif os.path.isfile(input_path):
             if input_path.lower().endswith('.zip'):
-                process_zip_file(input_path, writers, verbose, base_path, loglevel, separated)
+                process_zip_file(input_path, writers, verbose, base_path, loglevel, separated, localtime)
             elif looks_like_json_file(input_path):
-                process_json_file(input_path, writers, verbose, base_path, loglevel, separated)
+                process_json_file(input_path, writers, verbose, base_path, loglevel, separated, localtime)
             else:
-                raise ValueError("The input file must be a JSON or ZIP file.")
+                raise ValueError("Input must be JSON or ZIP")
         else:
-            raise ValueError(f"The provided path '{input_path}' is neither a directory nor a file.")
+            raise ValueError("Invalid input path")
     else:
-        # Process into a single CSV file
         with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = [column["csv_name"] for column in columns]
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter=delimiter)
+            writer = csv.DictWriter(
+                csvfile,
+                fieldnames=[c["csv_name"] for c in columns],
+                delimiter=delimiter
+            )
             writer.writeheader()
 
+            writers["common"] = writer
+
             if os.path.isdir(input_path):
-                process_directory(input_path, {'common': writer}, verbose, base_path, loglevel, separated)
+                process_directory(input_path, writers, verbose, base_path, loglevel, separated, localtime)
             elif os.path.isfile(input_path):
                 if input_path.lower().endswith('.zip'):
-                    process_zip_file(input_path, {'common': writer}, verbose, base_path, loglevel, separated)
+                    process_zip_file(input_path, writers, verbose, base_path, loglevel, separated, localtime)
                 elif looks_like_json_file(input_path):
-                    process_json_file(input_path, {'common': writer}, verbose, base_path, loglevel, separated)
+                    process_json_file(input_path, writers, verbose, base_path, loglevel, separated, localtime)
                 else:
-                    raise ValueError("The input file must be a JSON or ZIP file.")
+                    raise ValueError("Input must be JSON or ZIP")
             else:
-                raise ValueError(f"The provided path '{input_path}' is neither a directory nor a file.")
+                raise ValueError("Invalid input path")
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract specific fields from JSON logs and save them to a CSV file."
+        description="Extract fields from JSON logs and export to CSV"
     )
-    parser.add_argument(
-        "log_directory_or_file",
-        help="Path to a directory containing JSON logs, a single JSON log file, or a ZIP file with logs.",
-    )
-    parser.add_argument(
-        "output_file",
-        help="Path to the output file where extracted data will be saved.",
-    )
-    parser.add_argument(
-        "-d", "--delimiter",
-        default="\t",
-        help="Delimiter for the output file. Default is a tab character.",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable verbose mode for detailed logging of processing steps.",
-    )
+
+    parser.add_argument("log_directory_or_file")
+    parser.add_argument("output_file")
+    parser.add_argument("-d", "--delimiter", default="\t")
+    parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(
         "-l", "--loglevel",
         choices=LOG_LEVELS.keys(),
-        default="debug",
-        help=(
-            "Filter logs by level. Options are 'error', 'warning', 'informational', "
-            "and 'debug'. Default is 'debug'."
-        ),
+        default="debug"
     )
+    parser.add_argument("--separated", action="store_true")
     parser.add_argument(
-        "--separated",
+        "--localtime",
         action="store_true",
-        help="Whether to generate separate files for each host.",
+        help="Convert timestamps to local system time"
     )
 
     args = parser.parse_args()
+
     process_input(
         args.log_directory_or_file,
         args.output_file,
         args.delimiter,
         args.verbose,
         args.loglevel,
-        args.separated
+        args.separated,
+        args.localtime
     )
+
 
 if __name__ == "__main__":
     main()

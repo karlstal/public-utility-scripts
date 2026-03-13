@@ -24,3 +24,6 @@ A collection of utility scripts for various system and data analysis tasks.
 - **`mapping-depth.py`**  
   Analyze depth in S&N mappings. Useful for investigating deeply nested structures.
 
+  - **`get-graph-journals.py`**  
+  Get Optimizely Graph journals - All or only failed ones.
+
