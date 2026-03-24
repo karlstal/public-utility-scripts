@@ -6,35 +6,24 @@ import argparse
 import zipfile
 import tempfile
 from datetime import datetime
+import heapq
 
 # Constants
 MAX_DEPTH = 4
 
 # Columns to extract
 columns = [
-    {
-        "csv_name": "Date",
-        "json_key": "time",
-        "transform": lambda x: x if x else ""
-    },
-    {
-        "csv_name": "ResultDescription",
-        "json_key": "resultDescription",
-        "transform": lambda x: x.replace("\n", " ").replace("\r", " ").strip() if x else ""
-    },
+    {"csv_name": "Date", "json_key": "time", "transform": lambda x: x if x else ""},
+    {"csv_name": "ResultDescription", "json_key": "resultDescription",
+     "transform": lambda x: x.replace("\n", " ").replace("\r", " ").strip() if x else ""},
     {"csv_name": "Host", "json_key": "Host", "transform": lambda x: x},
     {"csv_name": "Level", "json_key": "level", "transform": lambda x: x},
     {"csv_name": "Container Id", "json_key": "containerId", "transform": lambda x: x},
     {"csv_name": "Operation Name", "json_key": "operationName", "transform": lambda x: x},
 ]
 
-# Log levels
-LOG_LEVELS = {
-    "error": 1,
-    "warning": 2,
-    "informational": 3,
-    "debug": 4,
-}
+LOG_LEVELS = {"error": 1, "warning": 2, "informational": 3, "debug": 4}
+
 
 def extract_data(log_line, loglevel, verbose=False):
     match = re.search(r'{.*}', log_line)
@@ -46,22 +35,13 @@ def extract_data(log_line, loglevel, verbose=False):
     try:
         log_data = json.loads(match.group(0))
         log_level = log_data.get("level", "").lower()
-
         if LOG_LEVELS.get(log_level, 0) > LOG_LEVELS.get(loglevel, 0):
-            if verbose:
-                print(f"Skipping line due to log level: {log_level}")
             return None
 
-        extracted = {}
-        for column in columns:
-            value = log_data.get(column["json_key"], "")
-            extracted[column["csv_name"]] = column["transform"](value)
-
+        extracted = {c["csv_name"]: c["transform"](log_data.get(c["json_key"], ""))
+                     for c in columns}
         return extracted
-
-    except json.JSONDecodeError as e:
-        if verbose:
-            print(f"Failed to decode JSON: {e}\nLine: {log_line.strip()}")
+    except json.JSONDecodeError:
         return None
 
 
@@ -70,125 +50,82 @@ def parse_timestamp(ts: str, convert_to_local: bool):
         return None
     try:
         ts = ts.replace("Z", "+00:00")
-        ts = re.sub(r'(\.\d{6})\d+', r'\1', ts)  # trim to microseconds
+        ts = re.sub(r'(\.\d{6})\d+', r'\1', ts)
         dt = datetime.fromisoformat(ts)
-
         if convert_to_local and dt.tzinfo is not None:
             dt = dt.astimezone()
-
         return dt
     except Exception:
         return None
 
 
-def process_json_file(
-    file_path, writers, verbose, base_path,
-    loglevel, separated, localtime
-):
-    if verbose:
-        print(f"Processing file: {compact_path(file_path, base_path)}")
-
-    total_lines = 0
-    written_lines = 0
-    empty_row = {col["csv_name"]: "" for col in columns}
-    prev_date = None
-    extracted_rows = []
-
-    with open(file_path, 'r', encoding='utf-8') as file:
-        for line in file:
-            total_lines += 1
+def json_file_iterator(file_path, loglevel, verbose):
+    """Yield extracted rows one by one from a JSON file."""
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
             data = extract_data(line, loglevel, verbose)
             if data:
-                data["_parsedDate"] = parse_timestamp(data["Date"], localtime)
-                extracted_rows.append(data)
-                written_lines += 1
-
-    extracted_rows.sort(
-        key=lambda x: x["_parsedDate"] if x["_parsedDate"] else datetime.min
-    )
-
-    for row in extracted_rows:
-        cur_date = row["_parsedDate"]
-
-        if not separated:
-            if cur_date and prev_date:
-                diff_ms = (cur_date - prev_date).total_seconds() * 1000
-                if diff_ms > 50:
-                    writers["common"].writerow(empty_row)
-
-            prev_date = cur_date
-            writers["common"].writerow(
-                {k: v for k, v in row.items() if k != "_parsedDate"}
-            )
-        else:
-            host = row["Host"]
-            writer = writers.get(host)
-            if not writer:
-                writer = create_csv_writer(host, base_path)
-                writers[host] = writer
-
-            writer.writerow(
-                {k: v for k, v in row.items() if k != "_parsedDate"}
-            )
-
-    if verbose:
-        print(
-            f"Finished file: {compact_path(file_path, base_path)} — "
-            f"Total: {total_lines}, Written: {written_lines}, "
-            f"Skipped: {total_lines - written_lines}"
-        )
+                data["_parsedDate"] = parse_timestamp(data["Date"], False)
+                yield data
 
 
-def create_csv_writer(host, base_path):
-    output_file = f"{host}.csv"
-    fieldnames = [column["csv_name"] for column in columns]
-    mode = 'a' if os.path.exists(output_file) else 'w'
+def process_directory(directory, loglevel, verbose):
+    files = []
+    for root, dirs, file_names in os.walk(directory):        
+        for name in file_names:
+            path = os.path.join(root, name)
+            if looks_like_json_file(path):
+                files.append(path)
+    return files
 
-    csvfile = open(output_file, mode, newline='', encoding='utf-8')
-    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
-    if mode == 'w':
+def process_zip_file(zip_path, verbose):
+    temp_dir = tempfile.TemporaryDirectory()
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(temp_dir.name)
+    files = process_directory(temp_dir.name, loglevel=None, verbose=verbose)
+    return files, temp_dir  # keep temp_dir alive until done
+
+
+def merge_streams(file_paths, output_file, delimiter, loglevel, verbose, localtime):
+    iterators = [json_file_iterator(fp, loglevel, verbose) for fp in file_paths]
+
+    heap = []
+    for i, it in enumerate(iterators):
+        try:
+            row = next(it)
+            heap.append((row["_parsedDate"] or datetime.min, i, row, it))
+        except StopIteration:
+            continue
+
+    heapq.heapify(heap)
+
+    with open(output_file, 'w', newline='', encoding='utf-8') as out:
+        writer = csv.DictWriter(out, fieldnames=[c["csv_name"] for c in columns], delimiter=delimiter)
         writer.writeheader()
 
-    print(f"Output path: {output_file}")
-    return writer
+        prev_date = None
+        empty_row = {c["csv_name"]: "" for c in columns}
 
+        while heap:
+            cur_date, i, row, it = heapq.heappop(heap)
 
-def process_directory(directory, writers, verbose, base_path, loglevel, separated, localtime):
-    if verbose:
-        print(f"Processing directory: {compact_path(directory, base_path)}")
+            # Insert empty row for time gaps > 50ms
+            if prev_date and cur_date:
+                diff_ms = (cur_date - prev_date).total_seconds() * 1000
+                if diff_ms > 50:
+                    writer.writerow(empty_row)
+            prev_date = cur_date
 
-    for root, dirs, files in os.walk(directory):
-        dirs.sort()
-        files.sort()
-        for file in files:
-            file_path = os.path.join(root, file)
-            if looks_like_json_file(file_path):
-                process_json_file(
-                    file_path, writers, verbose, base_path,
-                    loglevel, separated, localtime
-                )
+            # Remove internal helper key before writing
+            row_to_write = {k: v for k, v in row.items() if k != "_parsedDate"}
+            writer.writerow(row_to_write)
 
-
-def process_zip_file(zip_path, writers, verbose, base_path, loglevel, separated, localtime):
-    with tempfile.TemporaryDirectory() as temp_dir:
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
-            if verbose:
-                print(f"Extracted ZIP to: {temp_dir}")
-
-            process_directory(
-                temp_dir, writers, verbose, base_path,
-                loglevel, separated, localtime
-            )
-
-
-def compact_path(path, base_path):
-    relative = os.path.relpath(path, base_path)
-    parts = relative.split(os.sep)
-    if len(parts) > MAX_DEPTH:
-        parts = ['...'] + parts[-MAX_DEPTH:]
-    return os.sep.join(parts)
+            try:
+                next_row = next(it)
+                heapq.heappush(heap, (next_row["_parsedDate"] or datetime.min, i, next_row, it))
+            except StopIteration:
+                continue
 
 
 def looks_like_json_file(file_path, lines_to_check=5):
@@ -202,72 +139,39 @@ def looks_like_json_file(file_path, lines_to_check=5):
     return False
 
 
-def process_input(
-    input_path, output_file, delimiter,
-    verbose, loglevel, separated, localtime
-):
-    base_path = os.getcwd()
-    input_path = os.path.abspath(input_path)
-    output_file = os.path.abspath(output_file)
-
-    writers = {}
-
-    if separated:
-        if os.path.isdir(input_path):
-            process_directory(input_path, writers, verbose, base_path, loglevel, separated, localtime)
-        elif os.path.isfile(input_path):
-            if input_path.lower().endswith('.zip'):
-                process_zip_file(input_path, writers, verbose, base_path, loglevel, separated, localtime)
-            elif looks_like_json_file(input_path):
-                process_json_file(input_path, writers, verbose, base_path, loglevel, separated, localtime)
-            else:
-                raise ValueError("Input must be JSON or ZIP")
+def process_input(input_path, output_file, delimiter, verbose, loglevel, localtime):
+    if os.path.isdir(input_path):
+        files = process_directory(input_path, loglevel, verbose)
+        merge_streams(files, output_file, delimiter, loglevel, verbose, localtime)
+    elif os.path.isfile(input_path):
+        if input_path.lower().endswith('.zip'):
+            files, temp_dir = process_zip_file(input_path, verbose)
+            merge_streams(files, output_file, delimiter, loglevel, verbose, localtime)
+            temp_dir.cleanup()
+        elif looks_like_json_file(input_path):
+            merge_streams([input_path], output_file, delimiter, loglevel, verbose, localtime)
         else:
-            raise ValueError("Invalid input path")
+            raise ValueError("Input must be JSON or ZIP")
     else:
-        with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(
-                csvfile,
-                fieldnames=[c["csv_name"] for c in columns],
-                delimiter=delimiter
-            )
-            writer.writeheader()
+        raise ValueError("Invalid input path")
 
-            writers["common"] = writer
 
-            if os.path.isdir(input_path):
-                process_directory(input_path, writers, verbose, base_path, loglevel, separated, localtime)
-            elif os.path.isfile(input_path):
-                if input_path.lower().endswith('.zip'):
-                    process_zip_file(input_path, writers, verbose, base_path, loglevel, separated, localtime)
-                elif looks_like_json_file(input_path):
-                    process_json_file(input_path, writers, verbose, base_path, loglevel, separated, localtime)
-                else:
-                    raise ValueError("Input must be JSON or ZIP")
-            else:
-                raise ValueError("Invalid input path")
+def compact_path(path, base_path):
+    relative = os.path.relpath(path, base_path)
+    parts = relative.split(os.sep)
+    if len(parts) > MAX_DEPTH:
+        parts = ["..."] + parts[-MAX_DEPTH:]
+    return os.sep.join(parts)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Extract fields from JSON logs and export to CSV"
-    )
-
+    parser = argparse.ArgumentParser(description="Extract fields from JSON logs and export to CSV")
     parser.add_argument("log_directory_or_file")
     parser.add_argument("output_file")
     parser.add_argument("-d", "--delimiter", default="\t")
     parser.add_argument("-v", "--verbose", action="store_true")
-    parser.add_argument(
-        "-l", "--loglevel",
-        choices=LOG_LEVELS.keys(),
-        default="debug"
-    )
-    parser.add_argument("--separated", action="store_true")
-    parser.add_argument(
-        "--localtime",
-        action="store_true",
-        help="Convert timestamps to local system time"
-    )
+    parser.add_argument("-l", "--loglevel", choices=LOG_LEVELS.keys(), default="debug")
+    parser.add_argument("--localtime", action="store_true", help="Convert timestamps to local system time")
 
     args = parser.parse_args()
 
@@ -277,7 +181,6 @@ def main():
         args.delimiter,
         args.verbose,
         args.loglevel,
-        args.separated,
         args.localtime
     )
 
