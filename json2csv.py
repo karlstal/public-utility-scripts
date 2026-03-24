@@ -25,11 +25,13 @@ columns = [
 LOG_LEVELS = {"error": 1, "warning": 2, "informational": 3, "debug": 4}
 
 
-def extract_data(log_line, loglevel, verbose=False):
+def extract_data(log_line, loglevel, verbose=False, skipped_counter=None):
     match = re.search(r'{.*}', log_line)
     if not match:
         if verbose:
-            print(f"No JSON object found in line: {log_line.strip()}")
+            print(f"Skipping line, no JSON found: {log_line.strip()}")
+        if skipped_counter is not None:
+            skipped_counter[0] += 1
         return None
 
     try:
@@ -42,6 +44,10 @@ def extract_data(log_line, loglevel, verbose=False):
                      for c in columns}
         return extracted
     except json.JSONDecodeError:
+        if skipped_counter is not None:
+            skipped_counter[0] += 1
+        if verbose:
+            print(f"Failed to decode JSON: {log_line.strip()}")
         return None
 
 
@@ -59,11 +65,12 @@ def parse_timestamp(ts: str, convert_to_local: bool):
         return None
 
 
-def json_file_iterator(file_path, loglevel, verbose):
-    """Yield extracted rows one by one from a JSON file."""
+def json_file_iterator(file_path, loglevel, verbose, skipped_counter=None):
+    if verbose:
+        print(f"Processing file: {compact_path(file_path)}")
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
-            data = extract_data(line, loglevel, verbose)
+            data = extract_data(line, loglevel, verbose, skipped_counter)
             if data:
                 data["_parsedDate"] = parse_timestamp(data["Date"], False)
                 yield data
@@ -71,11 +78,13 @@ def json_file_iterator(file_path, loglevel, verbose):
 
 def process_directory(directory, loglevel, verbose):
     files = []
-    for root, dirs, file_names in os.walk(directory):        
+    for root, dirs, file_names in os.walk(directory):
         for name in file_names:
             path = os.path.join(root, name)
             if looks_like_json_file(path):
                 files.append(path)
+                if verbose:
+                    print(f"Found JSON file: {compact_path(path)}")
     return files
 
 
@@ -88,8 +97,10 @@ def process_zip_file(zip_path, verbose):
 
 
 def merge_streams(file_paths, output_file, delimiter, loglevel, verbose, localtime):
-    iterators = [json_file_iterator(fp, loglevel, verbose) for fp in file_paths]
-
+    skipped_counter = [0]  # mutable container to track skipped lines
+    iterators = [json_file_iterator(fp, loglevel, verbose, skipped_counter) for fp in file_paths]
+    total_rows_written = 0
+    
     heap = []
     for i, it in enumerate(iterators):
         try:
@@ -120,12 +131,19 @@ def merge_streams(file_paths, output_file, delimiter, loglevel, verbose, localti
             # Remove internal helper key before writing
             row_to_write = {k: v for k, v in row.items() if k != "_parsedDate"}
             writer.writerow(row_to_write)
+            total_rows_written += 1  # increment here
 
             try:
                 next_row = next(it)
                 heapq.heappush(heap, (next_row["_parsedDate"] or datetime.min, i, next_row, it))
             except StopIteration:
                 continue
+
+    if verbose:
+        print("\nSummary:")
+        print(f"Files found: {len(file_paths)}")
+        print(f"Lines skipped (couldn't parse JSON): {skipped_counter[0]}")
+        print(f"Log entries written: {total_rows_written}")
 
 
 def looks_like_json_file(file_path, lines_to_check=5):
@@ -156,11 +174,14 @@ def process_input(input_path, output_file, delimiter, verbose, loglevel, localti
         raise ValueError("Invalid input path")
 
 
-def compact_path(path, base_path):
-    relative = os.path.relpath(path, base_path)
-    parts = relative.split(os.sep)
-    if len(parts) > MAX_DEPTH:
-        parts = ["..."] + parts[-MAX_DEPTH:]
+def compact_path(path, max_depth=4):
+    """
+    Return a compact path showing only the last few directories + filename.
+    If the path is deeper than max_depth, prefix with '...'.
+    """
+    parts = path.split(os.sep)
+    if len(parts) > max_depth:
+        parts = ["..."] + parts[-max_depth:]
     return os.sep.join(parts)
 
 
