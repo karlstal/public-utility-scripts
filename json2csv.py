@@ -5,11 +5,12 @@ import re
 import argparse
 import zipfile
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 import heapq
 
 # Constants
 MAX_DEPTH = 4
+MIN_DT = datetime.min.replace(tzinfo=timezone.utc)
 
 # Columns to extract
 columns = [
@@ -57,22 +58,29 @@ def parse_timestamp(ts: str, convert_to_local: bool):
     try:
         ts = ts.replace("Z", "+00:00")
         ts = re.sub(r'(\.\d{6})\d+', r'\1', ts)
+
         dt = datetime.fromisoformat(ts)
-        if convert_to_local and dt.tzinfo is not None:
+
+        # Ensure timezone-aware
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        if convert_to_local:
             dt = dt.astimezone()
+
         return dt
     except Exception:
         return None
 
 
-def json_file_iterator(file_path, loglevel, verbose, skipped_counter=None):
+def json_file_iterator(file_path, loglevel, verbose, localtime, skipped_counter=None):
     if verbose:
         print(f"Processing file: {compact_path(file_path)}")
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
             data = extract_data(line, loglevel, verbose, skipped_counter)
             if data:
-                data["_parsedDate"] = parse_timestamp(data["Date"], False)
+                data["_parsedDate"] = parse_timestamp(data["Date"], localtime)
                 yield data
 
 
@@ -81,6 +89,10 @@ def process_directory(directory, loglevel, verbose):
     for root, dirs, file_names in os.walk(directory):
         for name in file_names:
             path = os.path.join(root, name)
+            # Only allow .json
+            if verbose and not name.lower().endswith((".json")):
+                print(f"Ignoring non-JSON file: {compact_path(path)}")
+                continue
             if looks_like_json_file(path):
                 files.append(path)
                 if verbose:
@@ -89,23 +101,23 @@ def process_directory(directory, loglevel, verbose):
 
 
 def process_zip_file(zip_path, verbose):
-    temp_dir = tempfile.TemporaryDirectory()
+    temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(temp_dir.name)
     files = process_directory(temp_dir.name, loglevel=None, verbose=verbose)
-    return files, temp_dir  # keep temp_dir alive until done
+    return files, temp_dir
 
 
 def merge_streams(file_paths, output_file, delimiter, loglevel, verbose, localtime):
-    skipped_counter = [0]  # mutable container to track skipped lines
-    iterators = [json_file_iterator(fp, loglevel, verbose, skipped_counter) for fp in file_paths]
+    skipped_counter = [0]
+    iterators = [json_file_iterator(fp, loglevel, verbose, localtime, skipped_counter) for fp in file_paths]
     total_rows_written = 0
-    
+
     heap = []
     for i, it in enumerate(iterators):
         try:
             row = next(it)
-            heap.append((row["_parsedDate"] or datetime.min, i, row, it))
+            heap.append((row["_parsedDate"] or MIN_DT, i, row, it))
         except StopIteration:
             continue
 
@@ -128,14 +140,13 @@ def merge_streams(file_paths, output_file, delimiter, loglevel, verbose, localti
                     writer.writerow(empty_row)
             prev_date = cur_date
 
-            # Remove internal helper key before writing
             row_to_write = {k: v for k, v in row.items() if k != "_parsedDate"}
             writer.writerow(row_to_write)
-            total_rows_written += 1  # increment here
+            total_rows_written += 1
 
             try:
                 next_row = next(it)
-                heapq.heappush(heap, (next_row["_parsedDate"] or datetime.min, i, next_row, it))
+                heapq.heappush(heap, (next_row["_parsedDate"] or MIN_DT, i, next_row, it))
             except StopIteration:
                 continue
 
@@ -150,7 +161,10 @@ def looks_like_json_file(file_path, lines_to_check=5):
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             for _ in range(lines_to_check):
-                if re.search(r'{.*}', f.readline()):
+                line = f.readline()
+                match = re.search(r'{.*}', line)
+                if match:
+                    json.loads(match.group(0))  # real validation
                     return True
     except Exception:
         pass
@@ -175,10 +189,6 @@ def process_input(input_path, output_file, delimiter, verbose, loglevel, localti
 
 
 def compact_path(path, max_depth=4):
-    """
-    Return a compact path showing only the last few directories + filename.
-    If the path is deeper than max_depth, prefix with '...'.
-    """
     parts = path.split(os.sep)
     if len(parts) > max_depth:
         parts = ["..."] + parts[-max_depth:]
