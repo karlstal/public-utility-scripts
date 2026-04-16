@@ -201,7 +201,7 @@ while true; do
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     DUMP_PATH="$DUMP_DIR/dump_${TARGET_PID}_${TIMESTAMP}.dmp"
 
-    echo "Creating dump at ${DUMP_PATH}..."
+    echo "Threshold exceeded: ${PERCENT}% (PID $TARGET_PID). Creating dump at ${DUMP_PATH}..."
     "$DOTNET_DUMP_CMD" collect -p "$TARGET_PID" -o "$DUMP_PATH"
     echo "Dump complete."
 
