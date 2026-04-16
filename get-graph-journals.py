@@ -83,7 +83,7 @@ def main():
     headers = build_auth_header(args.app_key, args.secret)
     journal_ids = [jid.strip() for jid in args.journal_ids.split(",")]
 
-    if args.output_file and os.path.exists(args.output_file):
+    if os.path.exists(args.output_file) :
         open(args.output_file, "w").close()  # clear file
 
     for journal_id in journal_ids:
