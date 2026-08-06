@@ -27,9 +27,9 @@ A collection of utility scripts for various system and data analysis tasks.
 - **`get-graph-journals.py`**  
   Get Optimizely Graph journals - All or only failed ones.
 
-- **`memory-dump-threshold.sh`**  
-  Monitors .NET processes for memory and thread‑count thresholds, creating memory dumps automatically when exceeded.  
-  Designed for Azure App Service environments. [📖 Detailed README](memory-dump-threshold-README.md)
+- **`dotnet-dump-threshold.sh`**  
+  Monitors .NET processes for memory and/or thread‑count thresholds, creating memory dumps automatically when exceeded.  
+  Designed for Azure App Service environments. [📖 Detailed README](dotnet-dump-threshold-README.md)
 
 - **`million.txt`**  
   A sample file with one million lines for testing purposes.
