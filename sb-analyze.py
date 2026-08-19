@@ -1,4 +1,4 @@
-__version__ = "1.0.4"
+__version__ = "1.0.7"
 
 import subprocess
 import sys
@@ -284,6 +284,13 @@ def fetch_messages(client: ServiceBusClient,
                             else:
                                 removed_dupes += 1
 
+                            # In Peek-Lock mode, abandon message immediately after logging/extracting reference
+                            if use_peek_lock:
+                                try:
+                                    receiver.abandon_message(msg)
+                                except Exception as ex:
+                                    logger.debug(f"Failed to abandon message {msg.message_id}: {ex}")
+
                         if not use_peek_lock and not sequence_number:
                             time.sleep(polling_interval)
 
@@ -311,14 +318,6 @@ def fetch_messages(client: ServiceBusClient,
                         logger.error(f"Unexpected error: {e}")
                         time.sleep(5)
                         continue
-
-                if use_peek_lock and all_messages:
-                    print("\nReleasing message locks back to queue (abandoning)...")
-                    for msg in all_messages:
-                        try:
-                            receiver.abandon_message(msg)
-                        except Exception as ex:
-                            logger.debug(f"Failed to abandon message {msg.message_id}: {ex}")
 
         except MessagingEntityNotFoundError as e:
             print(f"Error: The messaging entity was not found. Details: {e}")
@@ -433,7 +432,7 @@ def main():
     parser.add_argument("-mc", "--min-count", type=int, default=None, help="Optional lower threshold for count")
     
     # Optional CLI switch for Peek Lock
-    parser.add_argument("--peek-lock", action="store_true", default=False, help="Enable Peek-Lock mode instead of the default Peek. Neither will delete messages but Peek-Lock is a quicker way to get your sample if the subscription is quickly read by the original consumer.")
+    parser.add_argument("--peek-lock", action="store_true", default=False, help="Enable Peek-Lock mode instead of the default Peek. Neither will delete messages but Peek-Lock is a quicker way to get your sample if the subscription is quickly read by the original consumer")
 
     if len(sys.argv) == 1:
         parser.print_help()
