@@ -755,8 +755,10 @@ def build_analysis_report(groups,total_messages,min_pct=1.0,top=10):
             f"{key:<{DEFAULT_KEY_WIDTH}} | {format_age(average_age):>{age_width}}"
         )
     represented_pct=(displayed_count/total_messages)*100.0
-    top_text="all" if top<=0 else str(top)
-    lines.extend(["",f"Showing top {top_text} groups >= {min_pct:.2f}% of {total_messages} analyzed messages ({represented_pct:.2f}% represented)"])
+    summary=f"{len(displayed)} groups cover {represented_pct:.2f}% of {total_messages:,} analyzed messages."
+    if min_pct>0:
+        summary+=f" Groups below {min_pct:.2f}% are excluded."
+    lines.extend(["",summary])
     return "\n".join(lines)
 
 
