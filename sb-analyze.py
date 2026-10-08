@@ -1,29 +1,32 @@
 import argparse
 import base64
 import binascii
-import itertools
 import json
+import io
+from functools import lru_cache
 import logging
 import re
 import subprocess
 import sys
+
+if sys.version_info < (3, 11):
+    sys.exit("Python 3.11 or newer is required to run this analyzer.")
+
 import signal
 import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timezone
-VERSION = "2.0.1"
-DEFAULT_KEY_WIDTH = 120
+VERSION = "2.1.0"
+DEFAULT_KEY_WIDTH = 45
 DEFAULT_COUNT_WIDTH = 7
 DEFAULT_PROGRESS_WIDTH = 80
 DEFAULT_DEBUG_VALUE_WIDTH = 160
 logger = logging.getLogger(__name__)
-
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
-
 def ensure_package(package_name, import_name=None):
     if import_name is None:
         import_name = package_name
@@ -49,24 +52,14 @@ def ensure_dependencies():
     ensure_package("azure-identity", "azure.identity")
     ensure_package("wcf", "wcf")
     try:
-        from wcf.records.base import Record
-        import wcf.records.text
-        import wcf.records.attributes
-        import wcf.records.elements
-        from wcf.records import print_records
-        logger.debug(
-            "WCF imports OK; %d record types registered",
-            len(Record.records),
-        )
+        get_wcf_decoder()  # Import and register WCF records once.
     except ImportError:
         logger.exception("Unable to initialize the WCF binary parser")
         raise
 
 # ---------------------------------------------------------------------------
 # Helpers
-
 # ---------------------------------------------------------------------------
-
 def utc_now():
     return datetime.now(timezone.utc)
 
@@ -90,47 +83,28 @@ def normalize_namespace(namespace):
 
 def print_overwrite(text, width=DEFAULT_PROGRESS_WIDTH):
     print(f"\r{text:<{width}}", end="", flush=True)
-
 # ---------------------------------------------------------------------------
 # Message body
-
 # ---------------------------------------------------------------------------
-
 def get_message_body_bytes(message):
     try:
         body = message.body
         if body is None:
             return b""
-        if isinstance(body, bytes):
-            return body
-        if isinstance(body, bytearray):
-            return bytes(body)
-        if isinstance(body, memoryview):
-            return body.tobytes()
         if isinstance(body, str):
             return body.encode("utf-8")
-        result = bytearray()
-        for part in body:
-            if isinstance(part, bytes):
-                result.extend(part)
-            elif isinstance(part, bytearray):
-                result.extend(part)
-            elif isinstance(part, memoryview):
-                result.extend(part.tobytes())
-            elif isinstance(part, str):
-                result.extend(part.encode("utf-8"))
-            else:
-                result.extend(bytes(part))
-        return bytes(result)
+        if isinstance(body, (bytes, bytearray, memoryview)):
+            return bytes(body)
+        return b"".join(
+            part.encode("utf-8") if isinstance(part, str) else bytes(part)
+            for part in body
+        )
     except Exception:
         logger.exception("Unable to extract message body")
         return b""
-
 # ---------------------------------------------------------------------------
 # JSON handling
-
 # ---------------------------------------------------------------------------
-
 def find_cache_key_in_json(value):
     if isinstance(value, dict):
         preferred_names = (
@@ -180,12 +154,9 @@ def handle_json_message(body_bytes):
             "format": "JSON",
             "extracted_value": "[Invalid JSON]",
         }
-
 # ---------------------------------------------------------------------------
 # XML handling
-
 # ---------------------------------------------------------------------------
-
 def find_cache_key_in_xml(element):
     preferred_names = {
         "cachekey",
@@ -236,10 +207,8 @@ def handle_xml_message(body_bytes):
             "format": "XML",
             "extracted_value": "[Invalid XML]",
         }
-
 # ---------------------------------------------------------------------------
 # WCF Binary XML handling
-
 # ---------------------------------------------------------------------------
 WCF_FORMAT = "WCF Binary XML"
 
@@ -249,16 +218,19 @@ def wcf_result(value):
 def local_xml_name(name):
     name = str(name)
     return name.rsplit("}", 1)[-1] if "}" in name else name
-
-def decode_wcf_xml(body_bytes):
-    import io
+@lru_cache(maxsize=1)
+def get_wcf_decoder():
+    """Resolve WCF parser once, not once for every message."""
     from wcf.records.base import Record
     from wcf.records import print_records
-    import wcf.records.text
-    import wcf.records.attributes
-    import wcf.records.elements
-    source = io.BytesIO(body_bytes)
-    records = Record.parse(source)
+    import wcf.records.text  # noqa: F401 - registers record types
+    import wcf.records.attributes  # noqa: F401
+    import wcf.records.elements  # noqa: F401
+    return Record.parse, print_records
+
+def decode_wcf_xml(body_bytes):
+    parse_records, print_records = get_wcf_decoder()
+    records = parse_records(io.BytesIO(body_bytes))
     output = io.StringIO()
     print_records(records, fp=output)
     return output.getvalue()
@@ -360,7 +332,6 @@ def looks_like_dotnet_type(value):
     identifier = re.compile(r"^[A-Za-z_][A-Za-z0-9_`+]*$")
     return all(identifier.fullmatch(part) for part in parts)
 
-
 def dotnet_type_score(value):
     score = value.count(".") * 10
     leaf = value.rsplit(".", 1)[-1]
@@ -372,13 +343,11 @@ def dotnet_type_score(value):
         score += 10
     return score
 
-
 def select_dotnet_type(values):
     candidates = [value for value in values if looks_like_dotnet_type(value)]
     if not candidates:
         return None
     return max(candidates, key=lambda value: (dotnet_type_score(value), -values.index(value)))
-
 
 def decode_base64_parameter(value):
     if not value:
@@ -392,68 +361,120 @@ def decode_base64_parameter(value):
         values = extract_printable_binary_strings(raw)
     return select_dotnet_type(values) or (values[0] if values else None)
 
-def extract_wcf_parameter_value(parameter):
+# Extraction rules are data, not a growing chain of parameter-type checks.
+# Keys are normalized WCF i:type local names (case-insensitive).
+MESSAGE_EXTRACTORS = {
+    "string": {"strategy": "text", "label": "String", "fallback": "[Empty string]", "wildcards": True},
+    "base64binary": {"strategy": "base64", "label": "Base64Binary", "fallback": "[No extracted binary value]", "wildcards": False},
+    "remotepushmessage": {
+        "strategy": "embedded_json", "label": "RemotePushMessage",
+        "field": "Data.$type", "fallback_field": "Topic",
+        "strip_assembly": True, "fallback": "[Value not extracted]", "wildcards": False,
+    },
+    "statemessage": {
+        "strategy": "xml_child", "label": "StateMessage", "field": "Type",
+        "prefix": "StateMessage_", "fallback": "StateMessage_[unknown state]", "wildcards": False,
+    },
+}
+
+def nested_json_value(payload, path):
+    for part in path.split("."):
+        if not isinstance(payload, dict):
+            return None
+        payload = payload.get(part)
+    return payload if isinstance(payload, str) and payload.strip() else None
+
+def extract_embedded_json(parameter, rule):
+    for child in parameter.iter():
+        if "BackingField" not in local_xml_name(child.tag):
+            continue
+        try:
+            payload = json.loads((child.text or "").strip())
+        except (ValueError, TypeError):
+            continue
+        value = nested_json_value(payload, rule["field"])
+        if value:
+            return value.split(",", 1)[0].strip() if rule.get("strip_assembly") else value
+        value = nested_json_value(payload, rule["fallback_field"])
+        if value:
+            return value
+    return None
+
+def extract_xml_child(parameter, field):
+    for child in parameter.iter():
+        if child is not parameter and local_xml_name(child.tag) == field:
+            return (child.text or "").strip() or None
+    return None
+
+def extract_wcf_parameter(parameter):
+    """Return (source label, extracted value) using the configured rule."""
     parameter_type = get_parameter_type(parameter)
-    type_name = get_parameter_type_name(parameter_type)
-    value = (parameter.text or "").strip()
-    if type_name == "string":
-        return value or "[Empty String Parameter]"
-    if type_name == "base64binary":
-        return decode_base64_parameter(value) or parameter_type or "base64Binary"
-    if parameter_type:
-        return parameter_type
-    return "[Parameter has no type]"
+    rule = MESSAGE_EXTRACTORS.get(get_parameter_type_name(parameter_type))
+    if rule is None:
+        return "OtherParameter", parameter_type or "[Parameter has no type]"
+    strategy = rule["strategy"]
+    if strategy == "text":
+        value = (parameter.text or "").strip()
+    elif strategy == "base64":
+        value = decode_base64_parameter((parameter.text or "").strip())
+    elif strategy == "embedded_json":
+        value = extract_embedded_json(parameter, rule)
+    elif strategy == "xml_child":
+        child_value = extract_xml_child(parameter, rule["field"])
+        value = rule.get("prefix", "") + child_value if child_value else None
+    else:
+        raise ValueError(f"Unsupported extraction strategy: {strategy}")
+    return rule["label"], value or rule["fallback"]
 
 def handle_wcf_binary_message(body_bytes):
+    """Validate WCF by parsing records once; never label arbitrary bytes WCF."""
     try:
         xml_text = decode_wcf_xml(body_bytes)
-    except Exception:
-        logger.exception("Unable to decode WCF Binary XML")
-        return wcf_result(f"Unparsed WCF Binary: {len(body_bytes)} bytes")
-    try:
         root = parse_wcf_xml(xml_text)
-        if root is None:
-            return wcf_result("Decoded WCF but invalid XML")
-        parameter = find_wcf_parameter(root)
-        if parameter is None:
-            return wcf_result("Unknown WCF Event")
-        return wcf_result(extract_wcf_parameter_value(parameter))
     except Exception:
-        logger.exception("WCF decoded successfully but parameter extraction failed")
-        return wcf_result("WCF parameter extraction error")
-
+        logger.debug("WCF Binary XML parsing failed", exc_info=True)
+        return {"format": "Unknown Binary", "extracted_value": "[Unrecognized binary format]"}
+    if root is None:
+        return {"format": "Unknown Binary", "extracted_value": "[Invalid decoded XML]"}
+    # A successful record parse is not sufficient by itself to prove the
+    # payload is an application event. Require a Parameter element.
+    parameter = find_wcf_parameter(root)
+    if parameter is None:
+        return {"format": WCF_FORMAT, "extracted_value": "Unknown WCF Event"}
+    try:
+        kind, value = extract_wcf_parameter(parameter)
+        return {"format": WCF_FORMAT, "extracted_value": value, "value_kind": kind}
+    except Exception:
+        logger.debug("WCF parameter extraction failed", exc_info=True)
+        return {"format": WCF_FORMAT, "extracted_value": "[Extraction error]", "value_kind": "OtherParameter"}
 # ---------------------------------------------------------------------------
-# Format detection
-
+# Format detection and dispatch
 # ---------------------------------------------------------------------------
-
 def detect_format(body_bytes):
+    """Recognize textual candidates; binary content requires actual parsing."""
     if not body_bytes:
         return "empty"
-    stripped=body_bytes.lstrip()
-    if stripped.startswith((b"{",b"[")):
+    # UTF-8 BOM is permitted for textual messages.
+    stripped = body_bytes.lstrip(b" \t\r\n")
+    if stripped.startswith(b"\xef\xbb\xbf"):
+        stripped = stripped[3:].lstrip(b" \t\r\n")
+    if stripped.startswith((b"{", b"[")):
         return "json"
-    if stripped.startswith((b"<",b"\xef\xbb\xbf<")):
+    if stripped.startswith(b"<"):
         return "xml"
-    return "wcf"
+    return "binary_candidate"
 
 def handle_message_body(body_bytes):
     message_format = detect_format(body_bytes)
+    if message_format == "empty":
+        return {"format": "Empty", "extracted_value": "[Empty message body]"}
     if message_format == "json":
+        # Invalid JSON remains classified as JSON, not WCF.
         return handle_json_message(body_bytes)
     if message_format == "xml":
+        # Invalid XML remains classified as XML, not WCF.
         return handle_xml_message(body_bytes)
-    if message_format == "wcf":
-        return handle_wcf_binary_message(body_bytes)
-    return {
-        "format": "unknown",
-        "extracted_value": "[Empty message body]",
-    }
-
-# ---------------------------------------------------------------------------
-# Message processing
-
-# ---------------------------------------------------------------------------
+    return handle_wcf_binary_message(body_bytes)
 
 def process_message(message):
     body_bytes = get_message_body_bytes(message)
@@ -473,12 +494,9 @@ def process_message(message):
     )
     result["body_size"] = len(body_bytes)
     return result
-
 # ---------------------------------------------------------------------------
 # Risk calculation & Fast Pattern Matching / Grouping
-
 # ---------------------------------------------------------------------------
-
 def calculate_age_seconds(enqueued_time):
     if not enqueued_time:
         return None
@@ -490,6 +508,13 @@ def calculate_age_seconds(enqueued_time):
     except Exception:
         return None
 
+def format_elapsed(seconds):
+    """Format a duration as hours:minutes:seconds.milliseconds."""
+    total_ms = max(0, round(seconds * 1000))
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
 
 def format_age(seconds):
     if seconds is None:
@@ -508,8 +533,6 @@ def format_age(seconds):
     hours=int((seconds%86400)//3600)
     return f"{days}d {hours:02d}h"
 
-
-
 def is_variable_component(value):
     if not value:
         return False
@@ -523,10 +546,8 @@ def is_variable_component(value):
         return True
     return False
 
-
 def fixed_pattern_chars(pattern):
     return len(re.sub(r"[^A-Za-z0-9]","",pattern.replace("*","")))
-
 
 def wildcard_component(value):
     if is_variable_component(value):
@@ -536,10 +557,8 @@ def wildcard_component(value):
         return f"{match.group(1)}*"
     return None
 
-
 def pattern_candidates_for_value(value,max_wildcards):
     candidates=set()
-
     # Discover variable fields anywhere in colon-structured keys.
     # Examples:
     # EP:DOR:<guid>:default:ICart -> EP:DOR:*:default:ICart
@@ -551,12 +570,10 @@ def pattern_candidates_for_value(value,max_wildcards):
         wildcarded=wildcard_component(part)
         if wildcarded:
             variable_parts.append((index,wildcarded))
-
     for index,wildcarded in variable_parts:
         candidate=parts.copy()
         candidate[index]=wildcarded
         candidates.add(":".join(candidate))
-
     if max_wildcards>=2:
         for left in range(len(variable_parts)):
             for right in range(left+1,len(variable_parts)):
@@ -566,35 +583,29 @@ def pattern_candidates_for_value(value,max_wildcards):
                 candidate[left_index]=left_value
                 candidate[right_index]=right_value
                 candidates.add(":".join(candidate))
-
     # Terminal variable component after a structural delimiter.
     match=re.fullmatch(r"(.+[:_/|])([^:/_|]+)",value)
     if match and is_variable_component(match.group(2)):
         candidates.add(f"{match.group(1)}*")
-
     # Numeric ID followed by a stable suffix.
     for match in re.finditer(r"\d{3,}",value):
         prefix=value[:match.start()]
         suffix=value[match.end():]
         if suffix and re.search(r"[A-Za-z]",suffix):
             candidates.add(f"{prefix}*{suffix}")
-
     # Numeric terminal after '_' or '-'.
     match=re.fullmatch(r"(.+?[_-])(\d{3,})",value)
     if match:
         candidates.add(f"{match.group(1)}*")
-
     # Numeric terminal directly after text.
     match=re.fullmatch(r"(.+?[A-Za-z])(\d{3,})",value)
     if match:
         candidates.add(f"{match.group(1)}*")
-
     # Two variable spans with a stable suffix such as __CatalogContent.
     if max_wildcards>=2:
         match=re.fullmatch(r"(.+?[:_/|])([^:/_|]+)([:_/|])(.+?)(__[A-Za-z][A-Za-z0-9_]*)",value)
         if match and is_variable_component(match.group(2)):
             candidates.add(f"{match.group(1)}*{match.group(3)}*{match.group(5)}")
-
     return candidates
 
 def discover_patterns(values,min_support=3,max_wildcards=2,show_progress=True):
@@ -624,37 +635,39 @@ def discover_patterns(values,min_support=3,max_wildcards=2,show_progress=True):
     patterns.sort(key=lambda item:(item["wildcards"],-item["fixed_chars"],-len(item["values"]),item["pattern"]))
     return patterns
 
+def normalize_enqueue_time(value):
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+def group_kind(message):
+    return message.get("value_kind") or "Value"
 
 def build_exact_groups(messages):
     groups = defaultdict(list)
     for message in messages:
         value = message.get("extracted_value", "")
-        if value:
-            groups[value].append(message)
+        if value and message.get("format") != "Unknown Binary":
+            groups[(group_kind(message), value)].append(message)
     return groups
 
-def message_group_result(key,messages):
-    ages=[
-        calculate_age_seconds(item.get("enqueued_time"))
-        for item in messages
-    ]
-    ages=[age for age in ages if age is not None]
-    return {
-        "key":key,
-        "count":len(messages),
-        "ages":ages,
-    }
-
-
+def message_group_result(key, messages, kind=None):
+    ages = [calculate_age_seconds(item.get("enqueued_time")) for item in messages]
+    ages = [age for age in ages if age is not None]
+    return {"key": key, "kind": kind or group_kind(messages[0]),
+            "count": len(messages), "ages": ages,
+            "enqueued_times": [normalize_enqueue_time(item.get("enqueued_time")) for item in messages]}
 
 def sort_message_groups(groups):
-    groups.sort(key=lambda item: (-item["count"], item["key"]))
+    groups.sort(key=lambda item: (-item["count"], item["kind"], item["key"]))
     return groups
 
 def build_exact_group_results(exact_groups):
     return sort_message_groups([
-        message_group_result(value, messages)
-        for value, messages in exact_groups.items()
+        message_group_result(value, messages, kind)
+        for (kind, value), messages in exact_groups.items()
     ])
 
 def pattern_specificity(pattern):
@@ -666,56 +679,34 @@ def pattern_specificity(pattern):
         text,
     )
 
-
-def build_pattern_group_results(exact_groups,patterns,pattern_min_count=2):
-    groups=[]
-    represented_values=set()
-
-    # Most specific patterns claim keys first. A key can belong to only one
-    # displayed pattern, making group counts mutually exclusive.
-    for pattern in sorted(patterns,key=pattern_specificity):
-        available_values=[
-            value for value in pattern["values"]
-            if value not in represented_values
-        ]
-        if len(available_values)<pattern_min_count:
+def build_pattern_group_results(exact_groups, patterns, pattern_min_count=2):
+    groups = []
+    represented_values = set()
+    # Only actual string values are eligible for wildcard discovery.
+    for pattern in sorted(patterns, key=pattern_specificity):
+        available_values = [v for v in pattern["values"] if v not in represented_values]
+        if len(available_values) < pattern_min_count:
             continue
-
-        messages=[]
+        messages = []
         for value in available_values:
-            messages.extend(exact_groups.get(value,[]))
-
+            messages.extend(exact_groups.get(("String", value), []))
         represented_values.update(available_values)
-        groups.append(message_group_result(pattern["pattern"],messages))
-
-    # Exact keys that were not claimed by a qualifying pattern remain visible.
-    for value,messages in exact_groups.items():
-        if value not in represented_values:
-            groups.append(message_group_result(value,messages))
-
+        groups.append(message_group_result(pattern["pattern"], messages, "String"))
+    for (kind, value), messages in exact_groups.items():
+        if kind != "String" or value not in represented_values:
+            groups.append(message_group_result(value, messages, kind))
     return sort_message_groups(groups)
 
-def group_messages(
-    messages,
-    pattern_grouping=True,
-    pattern_min_count=2,
-    pattern_max_wildcards=2,
-):
+def group_messages(messages, pattern_grouping=True, pattern_min_count=2, pattern_max_wildcards=2):
     exact_groups = build_exact_groups(messages)
     if not exact_groups:
         return []
     if not pattern_grouping:
         return build_exact_group_results(exact_groups)
-    patterns = discover_patterns(
-        exact_groups.keys(),
-        min_support=pattern_min_count,
-        max_wildcards=pattern_max_wildcards,
-    )
-    return build_pattern_group_results(
-        exact_groups,
-        patterns,
-        pattern_min_count,
-    )
+    string_values = [value for kind, value in exact_groups if kind == "String"]
+    patterns = discover_patterns(string_values, min_support=pattern_min_count,
+                                 max_wildcards=pattern_max_wildcards) if string_values else []
+    return build_pattern_group_results(exact_groups, patterns, pattern_min_count)
 
 def truncate_text(value, width):
     value = str(value)
@@ -723,9 +714,9 @@ def truncate_text(value, width):
         return value
     return value[:width] if width <= 3 else value[:width - 3] + "..."
 
-def build_analysis_report(groups,total_messages,min_pct=1.0,top=10):
+def build_analysis_report(groups,total_messages,min_pct=1.0,top=10,full_values=False):
     if not groups or total_messages<=0:
-        return "No extracted cache keys found."
+        return "No extracted values found."
     eligible=[]
     for group in groups:
         pct=(group["count"]/total_messages)*100.0
@@ -737,22 +728,25 @@ def build_analysis_report(groups,total_messages,min_pct=1.0,top=10):
     displayed=eligible if top<=0 else eligible[:top]
     if not displayed:
         return f"No groups meet the minimum {min_pct:.2f}% threshold.\nAnalyzed messages: {total_messages}"
+    key_width = max(DEFAULT_KEY_WIDTH, *(len(str(g["key"])) for g in displayed)) if full_values else DEFAULT_KEY_WIDTH
     pct_width=13
     age_width=10
+    kind_width = 19
     lines=[
-        f"{'Count':<{DEFAULT_COUNT_WIDTH}} | {'% of messages':>{pct_width}} | {'Cache key / pattern':<{DEFAULT_KEY_WIDTH}} | {'Avg age':>{age_width}}",
-        f"{'-'*DEFAULT_COUNT_WIDTH}-+-{'-'*pct_width}-+-{'-'*DEFAULT_KEY_WIDTH}-+-{'-'*age_width}",
+        f"{'Count':>{DEFAULT_COUNT_WIDTH}} | {'% of messages':>{pct_width}} | {'Source':<{kind_width}} | {'Value / Pattern':<{key_width}} | {'Avg age':>{age_width}}",
+        f"{'-'*DEFAULT_COUNT_WIDTH}-+-{'-'*pct_width}-+-{'-'*kind_width}-+-{'-'*key_width}-+-{'-'*age_width}",
     ]
     displayed_count=0
     for group in displayed:
         count=group["count"]
         displayed_count+=count
-        key=truncate_text(group["key"],DEFAULT_KEY_WIDTH)
+        key=str(group["key"]) if full_values else truncate_text(group["key"],key_width)
         ages=group.get("ages",[])
         average_age=sum(ages)/len(ages) if ages else None
         lines.append(
-            f"{count:<{DEFAULT_COUNT_WIDTH}} | {group['percentage']:>{pct_width}.2f} | "
-            f"{key:<{DEFAULT_KEY_WIDTH}} | {format_age(average_age):>{age_width}}"
+            f"{count:>{DEFAULT_COUNT_WIDTH},} | {group['percentage']:>{pct_width}.2f} | "
+            f"{truncate_text(group['kind'], kind_width):<{kind_width}} | "
+            f"{key:<{key_width}} | {format_age(average_age):>{age_width}}"
         )
     represented_pct=(displayed_count/total_messages)*100.0
     summary=f"{len(displayed)} groups cover {represented_pct:.2f}% of {total_messages:,} analyzed messages."
@@ -761,19 +755,74 @@ def build_analysis_report(groups,total_messages,min_pct=1.0,top=10):
     lines.extend(["",summary])
     return "\n".join(lines)
 
+def build_throughput_report(messages, groups, elapsed, top, full_values=False):
+    """Report rates by Service Bus enqueue time, never collector receive time."""
+    from collections import Counter
+    from datetime import timedelta
+    timestamps = [normalize_enqueue_time(m.get("enqueued_time")) for m in messages]
+    valid = [t for t in timestamps if t is not None]
+    lines = ["Sampled enqueue-time throughput (not total subscription traffic)",
+             "------------------------------------------------------------------",
+             f"Captured messages: {len(messages):,}",
+             f"Messages with enqueue timestamp: {len(valid):,}",
+             f"Missing enqueue timestamp: {len(messages)-len(valid):,}"]
+    if not valid:
+        return "\n".join(lines + ["No enqueue timestamps available for rate calculations."])
+    start = min(valid).replace(microsecond=0)
+    end = max(valid).replace(microsecond=0)
+    # One-second inclusive span; no silent compression to collection duration.
+    span = int((end-start).total_seconds()) + 1
+    seconds = Counter(int((t-start).total_seconds()) for t in valid)
+    peak = max(seconds.values(), default=0)
+    lines += [f"First enqueued: {format_timestamp(start)} UTC",
+              f"Last enqueued:  {format_timestamp(max(valid))} UTC",
+              f"Enqueue span: {span:,} seconds",
+              f"Average sampled msg/s: {len(valid)/span:.2f}",
+              f"Peak sampled msg/s (1-second bucket): {peak:,}", "",
+              f"{'Enqueue minute (UTC)':<20} | {'Messages':>10} | {'Avg msg/s':>11} | {'Peak msg/s':>11}",
+              "-"*65]
+    # UTC wall-clock minute buckets. First and last minute may be partial.
+    minute_start = start.replace(second=0)
+    final_minute = end.replace(second=0)
+    while minute_start <= final_minute:
+        window_start = max(start, minute_start)
+        window_end = min(end + timedelta(seconds=1), minute_start + timedelta(minutes=1))
+        width = (window_end-window_start).total_seconds()
+        first_index = int((window_start-start).total_seconds())
+        last_index = int((window_end-start).total_seconds())
+        total = sum(seconds.get(i, 0) for i in range(first_index, last_index))
+        minute_peak = max((seconds.get(i, 0) for i in range(first_index, last_index)), default=0)
+        lines.append(f"{minute_start.strftime('%Y-%m-%d %H:%M'):<20} | {total:>10,} | {total/width:>11.2f} | {minute_peak:>11,}" +
+                     (f"  (partial {width:.0f}s)" if width < 60 else ""))
+        minute_start += timedelta(minutes=1)
+    lines += ["", "Per source / value (sampled enqueue-time rates)",
+              f"{'Count':>10} | {'Avg msg/s':>11} | {'Peak msg/s':>11} | {'Source':<19} | Value / Pattern",
+              "-"*112]
+    displayed = groups if top <= 0 else groups[:top]
+    for group in displayed:
+        group_times = [t for t in group["enqueued_times"] if t is not None]
+        group_seconds = Counter(int((t-start).total_seconds()) for t in group_times)
+        group_peak = max(group_seconds.values(), default=0)
+        lines.append(f"{len(group_times):>10,} | {len(group_times)/span:>11.2f} | "
+                     f"{group_peak:>11,} | {truncate_text(group['kind'], 19):<19} | "
+                     f"{str(group['key']) if full_values else truncate_text(group['key'], DEFAULT_KEY_WIDTH)}")
+    lines += ["", "Rates are based on enqueued_time_utc, including older captured messages.",
+              "Competing consumers and redelivery mean this is sampled traffic only."]
+    return "\n".join(lines)
 
-
-
-def write_output_file(filename,report,collection_started,collection_ended,elapsed,args,message_count):
+def write_output_file(filename,report,collection_started,collection_ended,elapsed,args,message_count,stop_reason):
     lines=[
         f"Namespace: {normalize_namespace(args.namespace)}",
         f"Topic: {args.topic_name}",
         f"Subscription: {args.subscription_name}",
         f"Mode: {'Peek' if args.peek else 'Peek-Lock'}",
         f"Messages analyzed: {message_count}",
+        f"Duration limit (minutes): {args.duration if args.duration is not None else 'none'}",
+        f"Message limit: {args.sample_size if args.sample_size is not None else 'none'}",
+        f"Stop reason: {stop_reason}",
         f"Collection started: {format_timestamp(collection_started)}",
         f"Collection ended: {format_timestamp(collection_ended)}",
-        f"Collection time: {elapsed:.1f} seconds",
+        f"Collection time: {format_elapsed(elapsed)}",
         "",
         report,
         "",
@@ -842,18 +891,12 @@ def create_subscription_receiver(client, args):
         prefetch_count=0,
     )
 
-def receive_message_batch(receiver, batch_size, args, use_peek_lock, sequence_number):
+def receive_message_batch(receiver, batch_size, use_peek_lock, sequence_number, wait):
     if use_peek_lock:
-        return receiver.receive_messages(
-            max_message_count=batch_size,
-            max_wait_time=args.polling,
-        )
+        return receiver.receive_messages(max_message_count=batch_size, max_wait_time=wait)
     if sequence_number is None:
         return receiver.peek_messages(max_message_count=batch_size)
-    return receiver.peek_messages(
-        max_message_count=batch_size,
-        sequence_number=sequence_number,
-    )
+    return receiver.peek_messages(max_message_count=batch_size, sequence_number=sequence_number)
 
 def next_peek_sequence_number(batch, current):
     if not batch:
@@ -869,95 +912,112 @@ def release_pending_message(receiver, message, pending_messages):
     if message in pending_messages:
         pending_messages.remove(message)
 
-def is_duplicate_message(message, message_ids):
-    message_id = get_message_id(message)
-    if not message_id:
-        return False
-    if message_id in message_ids:
-        return True
-    message_ids.add(message_id)
-    return False
-
-def print_processed_message(result,count,total,debug):
-    if debug:
-        value = truncate_text(result.get("extracted_value", ""),DEFAULT_DEBUG_VALUE_WIDTH)
-        print(f"\\n[{count}/{total}] {result.get('format', '')} -> {value}")
-    print_overwrite(f"Collected {count}/{total}")
-
-def process_received_message(
-    receiver,
-    message,
-    messages,
-    message_ids,
-    pending_messages,
-    args,
-    use_peek_lock,
-):
-    try:
-        if is_duplicate_message(message, message_ids):
+class ProgressReporter:
+    """Limit terminal writes; --debug still prints individual decoded messages."""
+    def __init__(self, args, interval=0.5):
+        self.args = args
+        self.interval = interval
+        self.last_print = float("-inf")
+    def update(self, result, count, elapsed, force=False):
+        if self.args.debug:
+            value = truncate_text(result.get("extracted_value", ""), DEFAULT_DEBUG_VALUE_WIDTH)
+            print(f"\n[{count}] {result.get('format', '')} -> {value}")
+        if not force and elapsed - self.last_print < self.interval:
             return
-        result = process_message(message)
-        messages.append(result)
-        print_processed_message(result,len(messages),args.sample_size,args.debug)
-    except Exception:
-        logger.exception("Error processing message")
-    finally:
-        if use_peek_lock:
-            release_pending_message(receiver, message, pending_messages)
+        limit = str(self.args.sample_size) if self.args.sample_size is not None else "unlimited"
+        print_overwrite(f"Collected {count}/{limit} | elapsed {format_elapsed(elapsed)}")
+        self.last_print = elapsed
 
 def fetch_messages(client, args, use_peek_lock):
-    messages = []
-    message_ids = set()
-    pending_messages = []
+    messages, seen_sequences, pending_messages = [], set(), []
     receiver = create_subscription_receiver(client, args)
     sequence_number = None
-    interrupted = False
+    start = time.monotonic()
+    deadline = start + args.duration * 60 if args.duration is not None else None
+    stop_reason = "unknown"
+    progress = ProgressReporter(args)
     try:
-        while len(messages) < args.sample_size and not interrupted:
-            batch_size = min(500, args.sample_size - len(messages))
-            try:
-                batch = receive_message_batch(receiver, batch_size, args, use_peek_lock, sequence_number)
-            except KeyboardInterrupt:
-                interrupted = True
+        while True:
+            now = time.monotonic()
+            if args.sample_size is not None and len(messages) >= args.sample_size:
+                stop_reason = "message limit reached"
                 break
-            except Exception as e:
-                logger.error("Error receiving messages: %s", e)
-                time.sleep(1)
+            if deadline is not None and now >= deadline:
+                stop_reason = "duration reached"
+                break
+            batch_size = min(500, args.sample_size - len(messages)) if args.sample_size is not None else 500
+            # Peek-Lock receive is bounded by the remaining collection duration.
+            # Peek API has no timeout argument, so its in-flight call may overrun slightly.
+            wait = min(args.polling, max(0.01, deadline - now)) if deadline is not None else args.polling
+            try:
+                batch = receive_message_batch(
+                    receiver, batch_size, use_peek_lock, sequence_number, wait
+                )
+            except KeyboardInterrupt:
+                stop_reason = "interrupted"
+                break
+            except Exception as exc:
+                logger.error("Error receiving messages: %s", exc)
+                if deadline is None or time.monotonic() < deadline:
+                    time.sleep(min(1, max(0, deadline - time.monotonic())) if deadline else 1)
                 continue
             if not batch:
-                time.sleep(1)
+                if not use_peek_lock:
+                    time.sleep(min(0.5, max(0, deadline - time.monotonic())) if deadline else 0.5)
                 continue
             if use_peek_lock:
                 pending_messages.extend(batch)
             else:
                 sequence_number = next_peek_sequence_number(batch, sequence_number)
             for message in batch:
-                if len(messages) >= args.sample_size:
+                # A batch can take time to decode; honor the deadline per message.
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    stop_reason = "duration reached"
+                    break
+                if args.sample_size is not None and len(messages) >= args.sample_size:
+                    stop_reason = "message limit reached"
                     break
                 try:
-                    process_received_message(receiver, message, messages, message_ids, pending_messages, args, use_peek_lock)
+                    # Sequence number is stable even when message_id is empty or reused.
+                    seq = getattr(message, "sequence_number", None)
+                    identity = (("sequence", seq) if seq is not None else
+                                ("id", get_message_id(message)) if get_message_id(message) else
+                                ("object", id(message)))
+                    if identity not in seen_sequences:
+                        seen_sequences.add(identity)
+                        # Record observation time before potentially expensive decoding.
+                        observed_second = now - start
+                        result = process_message(message)
+                        result["observed_second"] = observed_second
+                        messages.append(result)
+                        progress.update(result, len(messages), time.monotonic() - start)
                 except KeyboardInterrupt:
-                    interrupted = True
+                    stop_reason = "interrupted"
                     break
+                except Exception:
+                    logger.exception("Error processing message")
+                finally:
+                    if use_peek_lock:
+                        release_pending_message(receiver, message, pending_messages)
+            if stop_reason != "unknown":
+                break
     except KeyboardInterrupt:
-        interrupted = True
+        stop_reason = "interrupted"
     finally:
-        if interrupted:
-            print()
-            print(f"Collection interrupted. Analyzing {len(messages)} collected messages...")
-            if use_peek_lock:
-                abandon_pending_messages(receiver, pending_messages)
-        elif messages:
-            print()
+        if use_peek_lock:
+            abandon_pending_messages(receiver, pending_messages)
         try:
             receiver.close()
         except Exception:
             logger.exception("Error closing receiver")
-    return messages
+        if messages:
+            progress.update(messages[-1], len(messages), time.monotonic() - start, force=True)
+        print()
+    return messages, time.monotonic() - start, stop_reason
 
 def parse_args():
     parser=argparse.ArgumentParser(description="Analyze Azure Service Bus cache invalidation messages.")
-
     # Connection and authentication.
     parser.add_argument("-n","--namespace",required=True,help="Service Bus namespace")
     parser.add_argument("-s","--subscription",dest="subscription_name",required=True,help="Subscription name")
@@ -965,24 +1025,31 @@ def parse_args():
     parser.add_argument("-p","--shared-access-policy-name",help="SAS policy name")
     parser.add_argument("-k","--shared-access-policy-key",help="SAS policy key")
     parser.add_argument("--aad-username",help="Azure AD username")
-
     # Normal analysis controls.
-    parser.add_argument("-m","--size",dest="sample_size",type=int,default=100,help="Sample size (default: 100)")
+    parser.add_argument("-m","--size",dest="sample_size",type=int,default=None,help="Maximum messages (default: 100 if --duration is omitted)")
+    parser.add_argument("--duration",type=float,default=None,metavar="MINUTES",help="Collect for at most this many minutes")
     parser.add_argument("-o","--output",help="Write the final analysis report to a file")
     parser.add_argument("--top",type=int,default=10,help="Maximum groups to display (default: 10; 0 = unlimited)")
     parser.add_argument("--min-pct",type=float,default=1.0,help="Minimum percentage of analyzed messages to display (default: 1.0; 0 = disabled)")
     parser.add_argument("--peek",action="store_true",help="Use Peek instead of Peek-Lock")
     parser.add_argument("--polling",type=int,default=5,help="Receive wait time (default: 5)")
-
     # Pattern grouping controls.
     parser.add_argument("--no-pattern-grouping",action="store_true",help="Disable pattern grouping")
     parser.add_argument("--pattern-min-count",type=int,default=3,help="Minimum distinct keys required to form a pattern (default: 3)")
     parser.add_argument("--pattern-max-wildcards",type=int,default=2,help="Maximum wildcards in a discovered pattern (default: 2)")
-
     # Diagnostics.
     parser.add_argument("--debug",action="store_true",help="Show debug logging")
     parser.add_argument("--version",action="version",version=VERSION)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.duration is not None and (not __import__("math").isfinite(args.duration) or args.duration <= 0):
+        parser.error("--duration must be a positive finite number")
+    if args.sample_size is not None and args.sample_size <= 0:
+        parser.error("--size must be positive")
+    if args.polling <= 0:
+        parser.error("--polling must be positive")
+    if args.sample_size is None and args.duration is None:
+        args.sample_size = 100
+    return args
 
 def main():
     args = parse_args()
@@ -1018,10 +1085,8 @@ def main():
     client = None
     try:
         client = get_servicebus_client(args)
-        messages = fetch_messages(
-            client,
-            args,
-            use_peek_lock=not args.peek,
+        messages, collection_elapsed, stop_reason = fetch_messages(
+            client, args, use_peek_lock=not args.peek
         )
         groups = group_messages(
             messages,
@@ -1035,7 +1100,18 @@ def main():
                 args.pattern_max_wildcards
             ),
         )
-        report=build_analysis_report(groups,len(messages),args.min_pct,args.top)
+        # Capture rate measures this analyzer's collection speed, not the real consumer.
+        capture_rate = len(messages) / collection_elapsed if collection_elapsed > 0 else 0.0
+        capture_section = (f"Analyzer capture rate: {capture_rate:.2f} messages/s "
+                           f"({len(messages):,} unique messages / {format_elapsed(collection_elapsed)} collection time)\n"
+                           "Capture rate is not the subscription's arrival rate or the competing consumer's processing rate.")
+        report = (build_analysis_report(groups, len(messages), args.min_pct, args.top)
+                  + "\n\n" + build_throughput_report(messages, groups, collection_elapsed, args.top)
+                  + "\n\n" + capture_section)
+        file_report = (build_analysis_report(groups, len(messages), args.min_pct, args.top, full_values=True)
+                       + "\n\n" + build_throughput_report(messages, groups, collection_elapsed, args.top, full_values=True)
+                       + "\n\n" + capture_section)
+        print(f"Stop reason: {stop_reason}")
         print()
         print(report)
     except KeyboardInterrupt:
@@ -1055,25 +1131,26 @@ def main():
     print()
     print(
         f"Collection started:    "
-        f"{format_timestamp(collection_started)}"
+        f"{format_timestamp(collection_started)} UTC"
     )
     print(
         f"Collection ended:    "
-        f"{format_timestamp(collection_ended)}"
+        f"{format_timestamp(collection_ended)} UTC"
     )
     print(
         f"Collection time:     "
-        f"{elapsed:.1f} seconds"
+        f"{format_elapsed(elapsed)}"
     )
     if args.output:
         write_output_file(
             args.output,
-            report,
+            file_report,
             collection_started,
             collection_ended,
             elapsed,
             args,
             len(messages),
+            stop_reason,
         )
         print(f"Output written to: {args.output}")
     return 0
