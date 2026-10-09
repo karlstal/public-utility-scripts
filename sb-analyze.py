@@ -1,3 +1,8 @@
+import sys
+
+if sys.version_info < (3, 11):
+    sys.exit("Python 3.11 or newer is required to run this analyzer.")
+
 import argparse
 import base64
 import binascii
@@ -7,23 +12,20 @@ from functools import lru_cache
 import logging
 import re
 import subprocess
-import sys
-
-if sys.version_info < (3, 11):
-    sys.exit("Python 3.11 or newer is required to run this analyzer.")
-
 import signal
 import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timezone
+
 VERSION = "2.1.0"
 DEFAULT_KEY_WIDTH = 45
 DEFAULT_COUNT_WIDTH = 7
 DEFAULT_PROGRESS_WIDTH = 80
 DEFAULT_DEBUG_VALUE_WIDTH = 160
 logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
