@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timezone
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 DEFAULT_KEY_WIDTH = 45
 DEFAULT_COUNT_WIDTH = 7
 DEFAULT_PROGRESS_WIDTH = 80
@@ -864,11 +864,50 @@ def get_servicebus_client(args):
         credential=credential,
     )
 
+def friendly_servicebus_error(exc, args):
+    """Classify SDK errors without depending on exception-message wording."""
+    from azure.servicebus.exceptions import (
+        MessagingEntityNotFoundError, ServiceBusAuthenticationError,
+        ServiceBusAuthorizationError, ServiceBusConnectionError,
+        ServiceBusError,
+    )
+    if isinstance(exc, MessagingEntityNotFoundError):
+        return ("fatal", f"Topic '{args.topic_name}' or subscription "
+                f"'{args.subscription_name}' does not exist in "
+                f"'{normalize_namespace(args.namespace)}'. Check the names and namespace.")
+    if isinstance(exc, ServiceBusAuthenticationError):
+        return ("fatal", "Authentication failed. Check your credentials and Azure login.")
+    if isinstance(exc, ServiceBusAuthorizationError):
+        return ("fatal", "Access denied. The identity or SAS policy needs Listen permission "
+                "for this subscription.")
+    if isinstance(exc, ServiceBusConnectionError):
+        return ("retry", "Could not connect to Azure Service Bus. Check network connectivity "
+                "and firewall settings.")
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return ("retry", "The connection timed out or was interrupted.")
+    if isinstance(exc, ServiceBusError):
+        return ("retry" if getattr(exc, "is_transient", False) else "stop",
+                f"Service Bus operation failed ({type(exc).__name__}).")
+    return ("stop", f"Unexpected error ({type(exc).__name__}): {exc}")
+
+
+def show_operational_error(message, exc, debug=False):
+    print(f"\n{message}", file=sys.stderr)
+    if debug:
+        logger.exception("Operation details")
+
+
+class InitialCollectionError(Exception):
+    pass
+
+
 def abandon_message(receiver, message):
     try:
         receiver.abandon_message(message)
-    except Exception:
-        logger.exception("Error abandoning message")
+        return True
+    except Exception as exc:
+        logger.warning("Unable to abandon message: %s", exc)
+        return False
 
 def abandon_pending_messages(receiver,pending_messages):
     if not pending_messages:
@@ -910,8 +949,7 @@ def get_message_id(message):
     return str(getattr(message, "message_id", "") or "")
 
 def release_pending_message(receiver, message, pending_messages):
-    abandon_message(receiver, message)
-    if message in pending_messages:
+    if abandon_message(receiver, message) and message in pending_messages:
         pending_messages.remove(message)
 
 class ProgressReporter:
@@ -932,12 +970,15 @@ class ProgressReporter:
 
 def fetch_messages(client, args, use_peek_lock):
     messages, seen_sequences, pending_messages = [], set(), []
-    receiver = create_subscription_receiver(client, args)
+    receiver = None
     sequence_number = None
     start = time.monotonic()
     deadline = start + args.duration * 60 if args.duration is not None else None
     stop_reason = "unknown"
     progress = ProgressReporter(args)
+    consecutive_errors = 0
+    outage_started = None
+    next_outage_notice = None
     try:
         while True:
             now = time.monotonic()
@@ -952,6 +993,8 @@ def fetch_messages(client, args, use_peek_lock):
             # Peek API has no timeout argument, so its in-flight call may overrun slightly.
             wait = min(args.polling, max(0.01, deadline - now)) if deadline is not None else args.polling
             try:
+                if receiver is None:
+                    receiver = create_subscription_receiver(client, args)
                 batch = receive_message_batch(
                     receiver, batch_size, use_peek_lock, sequence_number, wait
                 )
@@ -959,10 +1002,53 @@ def fetch_messages(client, args, use_peek_lock):
                 stop_reason = "interrupted"
                 break
             except Exception as exc:
-                logger.error("Error receiving messages: %s", exc)
-                if deadline is None or time.monotonic() < deadline:
-                    time.sleep(min(1, max(0, deadline - time.monotonic())) if deadline else 1)
+                category, message = friendly_servicebus_error(exc, args)
+                if category != "retry":
+                    if not messages:
+                        raise InitialCollectionError(message) from exc
+                    stop_reason = f"collection aborted: {message}"
+                    show_operational_error(
+                        f"Collection stopped: {message} ({len(messages)} messages preserved)",
+                        exc, args.debug)
+                    break
+
+                consecutive_errors += 1
+                now = time.monotonic()
+                if outage_started is None:
+                    outage_started = now
+                    next_outage_notice = now + 60
+                    show_operational_error(
+                        f"Connection interrupted: {message} Reconnecting until collection ends...",
+                        exc, args.debug)
+                elif now >= next_outage_notice:
+                    elapsed_outage = now - outage_started
+                    print(f"\nStill disconnected ({format_elapsed(elapsed_outage)}); "
+                          f"{len(messages):,} messages preserved.", file=sys.stderr)
+                    next_outage_notice = now + 60
+
+                # A receiver can remain unusable after a network interruption.
+                # Best-effort release of any locked messages, then recreate it.
+                if receiver is not None:
+                    if use_peek_lock and pending_messages:
+                        abandon_pending_messages(receiver, pending_messages)
+                    try:
+                        receiver.close()
+                    except Exception:
+                        logger.debug("Could not close disconnected receiver", exc_info=True)
+                    receiver = None
+                backoff = min(60, 2 ** min(consecutive_errors - 1, 6))
+                if deadline is not None:
+                    backoff = min(backoff, max(0, deadline - time.monotonic()))
+                if backoff > 0:
+                    time.sleep(backoff)
                 continue
+            if outage_started is not None:
+                print(f"\nConnection restored after "
+                      f"{format_elapsed(time.monotonic() - outage_started)}. "
+                      f"Resuming collection ({len(messages):,} messages captured).")
+                outage_started = None
+                next_outage_notice = None
+            consecutive_errors = 0
             if not batch:
                 if not use_peek_lock:
                     time.sleep(min(0.5, max(0, deadline - time.monotonic())) if deadline else 0.5)
@@ -1007,10 +1093,11 @@ def fetch_messages(client, args, use_peek_lock):
     except KeyboardInterrupt:
         stop_reason = "interrupted"
     finally:
-        if use_peek_lock:
+        if use_peek_lock and receiver is not None:
             abandon_pending_messages(receiver, pending_messages)
         try:
-            receiver.close()
+            if receiver is not None:
+                receiver.close()
         except Exception:
             logger.exception("Error closing receiver")
         if messages:
@@ -1116,6 +1203,13 @@ def main():
         print(f"Stop reason: {stop_reason}")
         print()
         print(report)
+    except InitialCollectionError as exc:
+        show_operational_error(f"Cannot start collection: {exc}", exc, args.debug)
+        return 2
+    except Exception as exc:
+        _, message = friendly_servicebus_error(exc, args)
+        show_operational_error(f"Analyzer failed: {message}", exc, args.debug)
+        return 2
     except KeyboardInterrupt:
         return 130
     finally:
@@ -1144,7 +1238,8 @@ def main():
         f"{format_elapsed(elapsed)}"
     )
     if args.output:
-        write_output_file(
+        try:
+            write_output_file(
             args.output,
             file_report,
             collection_started,
@@ -1153,8 +1248,11 @@ def main():
             args,
             len(messages),
             stop_reason,
-        )
+            )
+        except OSError as exc:
+            show_operational_error(f"Could not write report '{args.output}': {exc}", exc, args.debug)
+            return 3
         print(f"Output written to: {args.output}")
-    return 0
+    return 1 if stop_reason.startswith("collection aborted:") else 0
 if __name__ == "__main__":
     sys.exit(main())
