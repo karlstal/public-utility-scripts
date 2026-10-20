@@ -8,6 +8,7 @@ import base64
 import binascii
 import json
 import io
+import math
 from functools import lru_cache
 import logging
 import re
@@ -16,15 +17,30 @@ import signal
 import threading
 import time
 import xml.etree.ElementTree as ET
-from collections import defaultdict
-from datetime import datetime, timezone
+from collections import defaultdict, Counter
+from datetime import datetime, timezone, timedelta
 
-VERSION = "2.1.1"
+VERSION = "2.3.0"
 DEFAULT_KEY_WIDTH = 45
 DEFAULT_COUNT_WIDTH = 7
-DEFAULT_PROGRESS_WIDTH = 80
+DEFAULT_PROGRESS_WIDTH = 95
 DEFAULT_DEBUG_VALUE_WIDTH = 160
 logger = logging.getLogger(__name__)
+
+# Pre-compiled Regexes for Performance
+RE_GUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+RE_HEX = re.compile(r"^[0-9a-fA-F]{8,}$")
+RE_HYPHEN_DIGITS = re.compile(r"^\d+(?:-\d+)+$")
+RE_WILDCARD_SUFFIX = re.compile(r"(.+?[:_/|])([^:/_|]+)")
+RE_DIGITS_3 = re.compile(r"\d{3,}")
+RE_SUFFIX_ALPHA = re.compile(r"[A-Za-z]")
+RE_PREFIX_HYPHEN_DIGITS = re.compile(r"(.+?[_-])(\d{3,})")
+RE_PREFIX_ALPHA_DIGITS = re.compile(r"(.+?[A-Za-z])(\d{3,})")
+RE_COMPLEX_PATTERN = re.compile(r"(.+?[:_/|])([^:/_|]+)([:_/|])(.+?)(__[A-Za-z][A-Za-z0-9_]*)")
+RE_DOTNET_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_`+]*$")
+RE_PRINTABLE_ASCII = re.compile(rb"[\x20-\x7e]{4,}")
+RE_NON_ALPHANUM = re.compile(r"[^A-Za-z0-9]")
+RE_WHITESPACE = re.compile(r"\s+")
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -85,6 +101,7 @@ def normalize_namespace(namespace):
 
 def print_overwrite(text, width=DEFAULT_PROGRESS_WIDTH):
     print(f"\r{text:<{width}}", end="", flush=True)
+
 # ---------------------------------------------------------------------------
 # Message body
 # ---------------------------------------------------------------------------
@@ -104,6 +121,7 @@ def get_message_body_bytes(message):
     except Exception:
         logger.exception("Unable to extract message body")
         return b""
+
 # ---------------------------------------------------------------------------
 # JSON handling
 # ---------------------------------------------------------------------------
@@ -156,6 +174,7 @@ def handle_json_message(body_bytes):
             "format": "JSON",
             "extracted_value": "[Invalid JSON]",
         }
+
 # ---------------------------------------------------------------------------
 # XML handling
 # ---------------------------------------------------------------------------
@@ -209,23 +228,22 @@ def handle_xml_message(body_bytes):
             "format": "XML",
             "extracted_value": "[Invalid XML]",
         }
+
 # ---------------------------------------------------------------------------
 # WCF Binary XML handling
 # ---------------------------------------------------------------------------
 WCF_FORMAT = "WCF Binary XML"
 
-def wcf_result(value):
-    return {"format": WCF_FORMAT, "extracted_value": value}
-
 def local_xml_name(name):
     name = str(name)
     return name.rsplit("}", 1)[-1] if "}" in name else name
+
 @lru_cache(maxsize=1)
 def get_wcf_decoder():
     """Resolve WCF parser once, not once for every message."""
     from wcf.records.base import Record
     from wcf.records import print_records
-    import wcf.records.text  # noqa: F401 - registers record types
+    import wcf.records.text  # noqa: F401
     import wcf.records.attributes  # noqa: F401
     import wcf.records.elements  # noqa: F401
     return Record.parse, print_records
@@ -308,17 +326,14 @@ def extract_nrbf_strings(data):
         if value not in seen:
             seen.add(value)
             values.append(value)
-        # This candidate had a valid .NET length-prefixed string boundary.
-        # Continue after the string so bytes inside it cannot become false
-        # nested strings such as "diachase..." from "Mediachase...".
         offset = end
     return values
 
 def extract_printable_binary_strings(data):
     values = []
     seen = set()
-    for match in re.findall(rb"[\x20-\x7e]{4,}", data):
-        value = match.decode("ascii", errors="ignore").strip()
+    for match in RE_PRINTABLE_ASCII.finditer(data):
+        value = match.group().decode("ascii", errors="ignore").strip()
         if not is_useful_binary_string(value) or value in seen:
             continue
         seen.add(value)
@@ -331,8 +346,7 @@ def looks_like_dotnet_type(value):
     parts = value.split(".")
     if len(parts) < 2:
         return False
-    identifier = re.compile(r"^[A-Za-z_][A-Za-z0-9_`+]*$")
-    return all(identifier.fullmatch(part) for part in parts)
+    return all(RE_DOTNET_IDENTIFIER.fullmatch(part) for part in parts)
 
 def dotnet_type_score(value):
     score = value.count(".") * 10
@@ -355,7 +369,7 @@ def decode_base64_parameter(value):
     if not value:
         return None
     try:
-        raw = base64.b64decode(re.sub(r"\s+", "", value), validate=True)
+        raw = base64.b64decode(RE_WHITESPACE.sub("", value), validate=True)
     except (ValueError, binascii.Error):
         return None
     values = extract_nrbf_strings(raw)
@@ -363,8 +377,6 @@ def decode_base64_parameter(value):
         values = extract_printable_binary_strings(raw)
     return select_dotnet_type(values) or (values[0] if values else None)
 
-# Extraction rules are data, not a growing chain of parameter-type checks.
-# Keys are normalized WCF i:type local names (case-insensitive).
 MESSAGE_EXTRACTORS = {
     "string": {"strategy": "text", "label": "String", "fallback": "[Empty string]", "wildcards": True},
     "base64binary": {"strategy": "base64", "label": "Base64Binary", "fallback": "[No extracted binary value]", "wildcards": False},
@@ -422,7 +434,7 @@ def extract_wcf_parameter(parameter):
     elif strategy == "embedded_json":
         value = extract_embedded_json(parameter, rule)
     elif strategy == "xml_child":
-        child_value = extract_xml_child(parameter, rule["field"])
+        child_value = extract_xml_child(parameter, field=rule["field"])
         value = rule.get("prefix", "") + child_value if child_value else None
     else:
         raise ValueError(f"Unsupported extraction strategy: {strategy}")
@@ -438,8 +450,6 @@ def handle_wcf_binary_message(body_bytes):
         return {"format": "Unknown Binary", "extracted_value": "[Unrecognized binary format]"}
     if root is None:
         return {"format": "Unknown Binary", "extracted_value": "[Invalid decoded XML]"}
-    # A successful record parse is not sufficient by itself to prove the
-    # payload is an application event. Require a Parameter element.
     parameter = find_wcf_parameter(root)
     if parameter is None:
         return {"format": WCF_FORMAT, "extracted_value": "Unknown WCF Event"}
@@ -449,6 +459,7 @@ def handle_wcf_binary_message(body_bytes):
     except Exception:
         logger.debug("WCF parameter extraction failed", exc_info=True)
         return {"format": WCF_FORMAT, "extracted_value": "[Extraction error]", "value_kind": "OtherParameter"}
+
 # ---------------------------------------------------------------------------
 # Format detection and dispatch
 # ---------------------------------------------------------------------------
@@ -456,7 +467,6 @@ def detect_format(body_bytes):
     """Recognize textual candidates; binary content requires actual parsing."""
     if not body_bytes:
         return "empty"
-    # UTF-8 BOM is permitted for textual messages.
     stripped = body_bytes.lstrip(b" \t\r\n")
     if stripped.startswith(b"\xef\xbb\xbf"):
         stripped = stripped[3:].lstrip(b" \t\r\n")
@@ -471,10 +481,8 @@ def handle_message_body(body_bytes):
     if message_format == "empty":
         return {"format": "Empty", "extracted_value": "[Empty message body]"}
     if message_format == "json":
-        # Invalid JSON remains classified as JSON, not WCF.
         return handle_json_message(body_bytes)
     if message_format == "xml":
-        # Invalid XML remains classified as XML, not WCF.
         return handle_xml_message(body_bytes)
     return handle_wcf_binary_message(body_bytes)
 
@@ -496,17 +504,21 @@ def process_message(message):
     )
     result["body_size"] = len(body_bytes)
     return result
+
 # ---------------------------------------------------------------------------
 # Risk calculation & Fast Pattern Matching / Grouping
 # ---------------------------------------------------------------------------
-def calculate_age_seconds(enqueued_time):
+def calculate_age_seconds(enqueued_time, captured_at=None):
+    """Calculate queue latency relative to capture time, not post-processing report time."""
     if not enqueued_time:
         return None
     try:
         if enqueued_time.tzinfo is None:
-            enqueued_time=enqueued_time.replace(tzinfo=timezone.utc)
-        now=datetime.now(timezone.utc)
-        return max(0.0,(now-enqueued_time).total_seconds())
+            enqueued_time = enqueued_time.replace(tzinfo=timezone.utc)
+        ref_time = captured_at or utc_now()
+        if ref_time.tzinfo is None:
+            ref_time = ref_time.replace(tzinfo=timezone.utc)
+        return max(0.0, (ref_time - enqueued_time).total_seconds())
     except Exception:
         return None
 
@@ -540,101 +552,91 @@ def is_variable_component(value):
         return False
     if value.isdigit():
         return True
-    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",value):
+    if RE_GUID.fullmatch(value):
         return True
-    if re.fullmatch(r"[0-9a-fA-F]{8,}",value) and any(ch.isdigit() for ch in value):
+    if RE_HEX.fullmatch(value) and any(ch.isdigit() for ch in value):
         return True
-    if re.fullmatch(r"\d+(?:-\d+)+",value):
+    if RE_HYPHEN_DIGITS.fullmatch(value):
         return True
     return False
 
 def fixed_pattern_chars(pattern):
-    return len(re.sub(r"[^A-Za-z0-9]","",pattern.replace("*","")))
+    return len(RE_NON_ALPHANUM.sub("", pattern.replace("*", "")))
 
 def wildcard_component(value):
     if is_variable_component(value):
         return "*"
-    match=re.fullmatch(r"(.+?[_-])(\d{3,})",value)
+    match = RE_PREFIX_HYPHEN_DIGITS.fullmatch(value)
     if match:
         return f"{match.group(1)}*"
     return None
 
-def pattern_candidates_for_value(value,max_wildcards):
-    candidates=set()
-    # Discover variable fields anywhere in colon-structured keys.
-    # Examples:
-    # EP:DOR:<guid>:default:ICart -> EP:DOR:*:default:ICart
-    # EP:DOR:<guid>:googlepay_buynow_<id>:ICart
-    #   -> EP:DOR:*:googlepay_buynow_*:ICart
-    parts=value.split(":")
-    variable_parts=[]
-    for index,part in enumerate(parts):
-        wildcarded=wildcard_component(part)
+def pattern_candidates_for_value(value, max_wildcards):
+    candidates = set()
+    parts = value.split(":")
+    variable_parts = []
+    for index, part in enumerate(parts):
+        wildcarded = wildcard_component(part)
         if wildcarded:
-            variable_parts.append((index,wildcarded))
-    for index,wildcarded in variable_parts:
-        candidate=parts.copy()
-        candidate[index]=wildcarded
+            variable_parts.append((index, wildcarded))
+    for index, wildcarded in variable_parts:
+        candidate = parts.copy()
+        candidate[index] = wildcarded
         candidates.add(":".join(candidate))
-    if max_wildcards>=2:
+    if max_wildcards >= 2:
         for left in range(len(variable_parts)):
-            for right in range(left+1,len(variable_parts)):
-                candidate=parts.copy()
-                left_index,left_value=variable_parts[left]
-                right_index,right_value=variable_parts[right]
-                candidate[left_index]=left_value
-                candidate[right_index]=right_value
+            for right in range(left + 1, len(variable_parts)):
+                candidate = parts.copy()
+                left_index, left_value = variable_parts[left]
+                right_index, right_value = variable_parts[right]
+                candidate[left_index] = left_value
+                candidate[right_index] = right_value
                 candidates.add(":".join(candidate))
-    # Terminal variable component after a structural delimiter.
-    match=re.fullmatch(r"(.+[:_/|])([^:/_|]+)",value)
+    match = RE_WILDCARD_SUFFIX.fullmatch(value)
     if match and is_variable_component(match.group(2)):
         candidates.add(f"{match.group(1)}*")
-    # Numeric ID followed by a stable suffix.
-    for match in re.finditer(r"\d{3,}",value):
-        prefix=value[:match.start()]
-        suffix=value[match.end():]
-        if suffix and re.search(r"[A-Za-z]",suffix):
+    for match in RE_DIGITS_3.finditer(value):
+        prefix = value[:match.start()]
+        suffix = value[match.end():]
+        if suffix and RE_SUFFIX_ALPHA.search(suffix):
             candidates.add(f"{prefix}*{suffix}")
-    # Numeric terminal after '_' or '-'.
-    match=re.fullmatch(r"(.+?[_-])(\d{3,})",value)
+    match = RE_PREFIX_HYPHEN_DIGITS.fullmatch(value)
     if match:
         candidates.add(f"{match.group(1)}*")
-    # Numeric terminal directly after text.
-    match=re.fullmatch(r"(.+?[A-Za-z])(\d{3,})",value)
+    match = RE_PREFIX_ALPHA_DIGITS.fullmatch(value)
     if match:
         candidates.add(f"{match.group(1)}*")
-    # Two variable spans with a stable suffix such as __CatalogContent.
-    if max_wildcards>=2:
-        match=re.fullmatch(r"(.+?[:_/|])([^:/_|]+)([:_/|])(.+?)(__[A-Za-z][A-Za-z0-9_]*)",value)
+    if max_wildcards >= 2:
+        match = RE_COMPLEX_PATTERN.fullmatch(value)
         if match and is_variable_component(match.group(2)):
             candidates.add(f"{match.group(1)}*{match.group(3)}*{match.group(5)}")
     return candidates
 
-def discover_patterns(values,min_support=3,max_wildcards=2,show_progress=True):
-    values=list(dict.fromkeys(values))
-    total=len(values)
-    if total<min_support:
+def discover_patterns(values, min_support=3, max_wildcards=2, show_progress=True):
+    values = list(dict.fromkeys(values))
+    total = len(values)
+    if total < min_support:
         return []
-    candidate_values=defaultdict(set)
-    for index,value in enumerate(values,1):
-        for pattern in pattern_candidates_for_value(value,max_wildcards):
-            if pattern.count("*")<=max_wildcards and fixed_pattern_chars(pattern)>=3:
+    candidate_values = defaultdict(set)
+    for index, value in enumerate(values, 1):
+        for pattern in pattern_candidates_for_value(value, max_wildcards):
+            if pattern.count("*") <= max_wildcards and fixed_pattern_chars(pattern) >= 3:
                 candidate_values[pattern].add(value)
-        if show_progress and (index==total or index%100==0):
+        if show_progress and (index == total or index % 100 == 0):
             print_overwrite(f"Discovering patterns {index}/{total}")
     if show_progress:
         print()
-    patterns=[]
-    for pattern,matched in candidate_values.items():
-        if len(matched)<min_support:
+    patterns = []
+    for pattern, matched in candidate_values.items():
+        if len(matched) < min_support:
             continue
         patterns.append({
-            "pattern":pattern,
-            "values":matched,
-            "wildcards":pattern.count("*"),
-            "fixed_chars":fixed_pattern_chars(pattern),
+            "pattern": pattern,
+            "values": matched,
+            "wildcards": pattern.count("*"),
+            "fixed_chars": fixed_pattern_chars(pattern),
         })
-    patterns.sort(key=lambda item:(item["wildcards"],-item["fixed_chars"],-len(item["values"]),item["pattern"]))
+    patterns.sort(key=lambda item: (item["wildcards"], -item["fixed_chars"], -len(item["values"]), item["pattern"]))
     return patterns
 
 def normalize_enqueue_time(value):
@@ -656,11 +658,18 @@ def build_exact_groups(messages):
     return groups
 
 def message_group_result(key, messages, kind=None):
-    ages = [calculate_age_seconds(item.get("enqueued_time")) for item in messages]
+    ages = [
+        calculate_age_seconds(item.get("enqueued_time"), item.get("captured_at")) 
+        for item in messages
+    ]
     ages = [age for age in ages if age is not None]
-    return {"key": key, "kind": kind or group_kind(messages[0]),
-            "count": len(messages), "ages": ages,
-            "enqueued_times": [normalize_enqueue_time(item.get("enqueued_time")) for item in messages]}
+    return {
+        "key": key,
+        "kind": kind or group_kind(messages[0]),
+        "count": len(messages),
+        "ages": ages,
+        "enqueued_times": [normalize_enqueue_time(item.get("enqueued_time")) for item in messages]
+    }
 
 def sort_message_groups(groups):
     groups.sort(key=lambda item: (-item["count"], item["kind"], item["key"]))
@@ -673,7 +682,7 @@ def build_exact_group_results(exact_groups):
     ])
 
 def pattern_specificity(pattern):
-    text=pattern["pattern"]
+    text = pattern["pattern"]
     return (
         pattern["wildcards"],
         -pattern["fixed_chars"],
@@ -684,7 +693,6 @@ def pattern_specificity(pattern):
 def build_pattern_group_results(exact_groups, patterns, pattern_min_count=2):
     groups = []
     represented_values = set()
-    # Only actual string values are eligible for wildcard discovery.
     for pattern in sorted(patterns, key=pattern_specificity):
         available_values = [v for v in pattern["values"] if v not in represented_values]
         if len(available_values) < pattern_min_count:
@@ -706,8 +714,11 @@ def group_messages(messages, pattern_grouping=True, pattern_min_count=2, pattern
     if not pattern_grouping:
         return build_exact_group_results(exact_groups)
     string_values = [value for kind, value in exact_groups if kind == "String"]
-    patterns = discover_patterns(string_values, min_support=pattern_min_count,
-                                 max_wildcards=pattern_max_wildcards) if string_values else []
+    patterns = discover_patterns(
+        string_values,
+        min_support=pattern_min_count,
+        max_wildcards=pattern_max_wildcards
+    ) if string_values else []
     return build_pattern_group_results(exact_groups, patterns, pattern_min_count)
 
 def truncate_text(value, width):
@@ -716,104 +727,111 @@ def truncate_text(value, width):
         return value
     return value[:width] if width <= 3 else value[:width - 3] + "..."
 
-def build_analysis_report(groups,total_messages,min_pct=1.0,top=10,full_values=False):
-    if not groups or total_messages<=0:
+def build_analysis_report(groups, total_messages, min_pct=1.0, top=10, full_values=False):
+    if not groups or total_messages <= 0:
         return "No extracted values found."
-    eligible=[]
+    eligible = []
     for group in groups:
-        pct=(group["count"]/total_messages)*100.0
-        if pct>=min_pct:
-            item=dict(group)
-            item["percentage"]=pct
+        pct = (group["count"] / total_messages) * 100.0
+        if pct >= min_pct:
+            item = dict(group)
+            item["percentage"] = pct
             eligible.append(item)
-    eligible=sort_message_groups(eligible)
-    displayed=eligible if top<=0 else eligible[:top]
+    eligible = sort_message_groups(eligible)
+    displayed = eligible if top <= 0 else eligible[:top]
     if not displayed:
         return f"No groups meet the minimum {min_pct:.2f}% threshold.\nAnalyzed messages: {total_messages}"
     key_width = max(DEFAULT_KEY_WIDTH, *(len(str(g["key"])) for g in displayed)) if full_values else DEFAULT_KEY_WIDTH
-    pct_width=13
-    age_width=10
+    pct_width = 13
+    age_width = 10
     kind_width = 19
-    lines=[
+    lines = [
         f"{'Count':>{DEFAULT_COUNT_WIDTH}} | {'% of messages':>{pct_width}} | {'Source':<{kind_width}} | {'Value / Pattern':<{key_width}} | {'Avg age':>{age_width}}",
         f"{'-'*DEFAULT_COUNT_WIDTH}-+-{'-'*pct_width}-+-{'-'*kind_width}-+-{'-'*key_width}-+-{'-'*age_width}",
     ]
-    displayed_count=0
+    displayed_count = 0
     for group in displayed:
-        count=group["count"]
-        displayed_count+=count
-        key=str(group["key"]) if full_values else truncate_text(group["key"],key_width)
-        ages=group.get("ages",[])
-        average_age=sum(ages)/len(ages) if ages else None
+        count = group["count"]
+        displayed_count += count
+        key = str(group["key"]) if full_values else truncate_text(group["key"], key_width)
+        ages = group.get("ages", [])
+        average_age = sum(ages) / len(ages) if ages else None
         lines.append(
             f"{count:>{DEFAULT_COUNT_WIDTH},} | {group['percentage']:>{pct_width}.2f} | "
             f"{truncate_text(group['kind'], kind_width):<{kind_width}} | "
             f"{key:<{key_width}} | {format_age(average_age):>{age_width}}"
         )
-    represented_pct=(displayed_count/total_messages)*100.0
-    summary=f"{len(displayed)} groups cover {represented_pct:.2f}% of {total_messages:,} analyzed messages."
-    if min_pct>0:
-        summary+=f" Groups below {min_pct:.2f}% are excluded."
-    lines.extend(["",summary])
+    represented_pct = (displayed_count / total_messages) * 100.0
+    summary = f"{len(displayed)} groups cover {represented_pct:.2f}% of {total_messages:,} analyzed messages."
+    if min_pct > 0:
+        summary += f" Groups below {min_pct:.2f}% are excluded."
+    lines.extend(["", summary])
     return "\n".join(lines)
 
 def build_throughput_report(messages, groups, elapsed, top, full_values=False):
-    """Report rates by Service Bus enqueue time, never collector receive time."""
-    from collections import Counter
-    from datetime import timedelta
     timestamps = [normalize_enqueue_time(m.get("enqueued_time")) for m in messages]
     valid = [t for t in timestamps if t is not None]
-    lines = ["Sampled enqueue-time throughput (not total subscription traffic)",
-             "------------------------------------------------------------------",
-             f"Captured messages: {len(messages):,}",
-             f"Messages with enqueue timestamp: {len(valid):,}",
-             f"Missing enqueue timestamp: {len(messages)-len(valid):,}"]
+    lines = [
+        "Sampled enqueue-time throughput (not total subscription traffic)",
+        "------------------------------------------------------------------",
+        f"Captured messages: {len(messages):,}",
+        f"Messages with enqueue timestamp: {len(valid):,}",
+        f"Missing enqueue timestamp: {len(messages)-len(valid):,}"
+    ]
     if not valid:
         return "\n".join(lines + ["No enqueue timestamps available for rate calculations."])
     start = min(valid).replace(microsecond=0)
     end = max(valid).replace(microsecond=0)
-    # One-second inclusive span; no silent compression to collection duration.
-    span = int((end-start).total_seconds()) + 1
-    seconds = Counter(int((t-start).total_seconds()) for t in valid)
+    span = int((end - start).total_seconds()) + 1
+    seconds = Counter(int((t - start).total_seconds()) for t in valid)
     peak = max(seconds.values(), default=0)
-    lines += [f"First enqueued: {format_timestamp(start)} UTC",
-              f"Last enqueued:  {format_timestamp(max(valid))} UTC",
-              f"Enqueue span: {span:,} seconds",
-              f"Average sampled msg/s: {len(valid)/span:.2f}",
-              f"Peak sampled msg/s (1-second bucket): {peak:,}", "",
-              f"{'Enqueue minute (UTC)':<20} | {'Messages':>10} | {'Avg msg/s':>11} | {'Peak msg/s':>11}",
-              "-"*65]
-    # UTC wall-clock minute buckets. First and last minute may be partial.
+    lines += [
+        f"First enqueued: {format_timestamp(start)} UTC",
+        f"Last enqueued:  {format_timestamp(max(valid))} UTC",
+        f"Enqueue span: {span:,} seconds",
+        f"Average sampled msg/s: {len(valid)/span:.2f}",
+        f"Peak sampled msg/s (1-second bucket): {peak:,}", "",
+        f"{'Enqueue minute (UTC)':<20} | {'Messages':>10} | {'Avg msg/s':>11} | {'Peak msg/s':>11}",
+        "-" * 65
+    ]
     minute_start = start.replace(second=0)
     final_minute = end.replace(second=0)
     while minute_start <= final_minute:
         window_start = max(start, minute_start)
         window_end = min(end + timedelta(seconds=1), minute_start + timedelta(minutes=1))
-        width = (window_end-window_start).total_seconds()
-        first_index = int((window_start-start).total_seconds())
-        last_index = int((window_end-start).total_seconds())
+        width = (window_end - window_start).total_seconds()
+        first_index = int((window_start - start).total_seconds())
+        last_index = int((window_end - start).total_seconds())
         total = sum(seconds.get(i, 0) for i in range(first_index, last_index))
         minute_peak = max((seconds.get(i, 0) for i in range(first_index, last_index)), default=0)
-        lines.append(f"{minute_start.strftime('%Y-%m-%d %H:%M'):<20} | {total:>10,} | {total/width:>11.2f} | {minute_peak:>11,}" +
-                     (f"  (partial {width:.0f}s)" if width < 60 else ""))
+        lines.append(
+            f"{minute_start.strftime('%Y-%m-%d %H:%M'):<20} | {total:>10,} | {total/width:>11.2f} | {minute_peak:>11,}" +
+            (f"  (partial {width:.0f}s)" if width < 60 else "")
+        )
         minute_start += timedelta(minutes=1)
-    lines += ["", "Per source / value (sampled enqueue-time rates)",
-              f"{'Count':>10} | {'Avg msg/s':>11} | {'Peak msg/s':>11} | {'Source':<19} | Value / Pattern",
-              "-"*112]
+    lines += [
+        "", "Per source / value (sampled enqueue-time rates)",
+        f"{'Count':>10} | {'Avg msg/s':>11} | {'Peak msg/s':>11} | {'Source':<19} | Value / Pattern",
+        "-" * 112
+    ]
     displayed = groups if top <= 0 else groups[:top]
     for group in displayed:
         group_times = [t for t in group["enqueued_times"] if t is not None]
-        group_seconds = Counter(int((t-start).total_seconds()) for t in group_times)
+        group_seconds = Counter(int((t - start).total_seconds()) for t in group_times)
         group_peak = max(group_seconds.values(), default=0)
-        lines.append(f"{len(group_times):>10,} | {len(group_times)/span:>11.2f} | "
-                     f"{group_peak:>11,} | {truncate_text(group['kind'], 19):<19} | "
-                     f"{str(group['key']) if full_values else truncate_text(group['key'], DEFAULT_KEY_WIDTH)}")
-    lines += ["", "Rates are based on enqueued_time_utc, including older captured messages.",
-              "Competing consumers and redelivery mean this is sampled traffic only."]
+        lines.append(
+            f"{len(group_times):>10,} | {len(group_times)/span:>11.2f} | "
+            f"{group_peak:>11,} | {truncate_text(group['kind'], 19):<19} | "
+            f"{str(group['key']) if full_values else truncate_text(group['key'], DEFAULT_KEY_WIDTH)}"
+        )
+    lines += [
+        "", "Rates are based on enqueued_time_utc, including older captured messages.",
+        "Competing consumers and redelivery mean this is sampled traffic only."
+    ]
     return "\n".join(lines)
 
-def write_output_file(filename,report,collection_started,collection_ended,elapsed,args,message_count,stop_reason):
-    lines=[
+def write_output_file(filename, report, collection_started, collection_ended, elapsed, args, message_count, stop_reason):
+    lines = [
         f"Namespace: {normalize_namespace(args.namespace)}",
         f"Topic: {args.topic_name}",
         f"Subscription: {args.subscription_name}",
@@ -829,33 +847,132 @@ def write_output_file(filename,report,collection_started,collection_ended,elapse
         report,
         "",
     ]
-    with open(filename,"w",encoding="utf-8") as output_file:
+    with open(filename, "w", encoding="utf-8") as output_file:
         output_file.write("\n".join(lines))
+
+# ---------------------------------------------------------------------------
+# Management & Auto-Discovery
+# ---------------------------------------------------------------------------
+def get_servicebus_admin_client(args):
+    from azure.servicebus.management import ServiceBusAdministrationClient
+    fully_qualified_namespace = normalize_namespace(args.namespace)
+    if args.shared_access_policy_name and args.shared_access_policy_key:
+        connection_string = (
+            f"Endpoint=sb://{fully_qualified_namespace}/;"
+            f"SharedAccessKeyName={args.shared_access_policy_name};"
+            f"SharedAccessKey={args.shared_access_policy_key}"
+        )
+        return ServiceBusAdministrationClient.from_connection_string(connection_string)
+    if args.aad_username:
+        from azure.identity import InteractiveBrowserCredential
+        credential = InteractiveBrowserCredential(username=args.aad_username)
+    else:
+        from azure.identity import DefaultAzureCredential
+        credential = DefaultAzureCredential()
+    return ServiceBusAdministrationClient(
+        fully_qualified_namespace=fully_qualified_namespace,
+        credential=credential,
+    )
+
+def discover_and_select_subscription(args):
+    print(f"Discovering active subscriptions for topic '{args.topic_name}' in '{normalize_namespace(args.namespace)}'...")
+    try:
+        admin_client = get_servicebus_admin_client(args)
+        subscriptions = []
+        with admin_client:
+            sub_properties = admin_client.list_subscriptions(topic_name=args.topic_name)
+            for sub in sub_properties:
+                active = 0
+                dlq = 0
+                scheduled = 0
+                
+                # Extract counts safely from the SDK's MessageCountDetails object
+                counts = getattr(sub, "count_details", getattr(sub, "message_count_details", None))
+                if counts:
+                    active = getattr(counts, "active_message_count", 0)
+                    dlq = getattr(counts, "dead_letter_message_count", 0)
+                    scheduled = getattr(counts, "scheduled_message_count", 0)
+                
+                subscriptions.append({
+                    "name": sub.name,
+                    "active": active,
+                    "dlq": dlq,
+                    "scheduled": scheduled,
+                    "status": getattr(sub, "status", "Unknown"),
+                    "forward_to": getattr(sub, "forward_to", None)
+                })
+    except Exception as exc:
+        print(f"\n[Error] Failed to auto-discover subscriptions: {exc}", file=sys.stderr)
+        print("Please specify a subscription manually using '-s / --subscription'.", file=sys.stderr)
+        sys.exit(2)
+
+    if not subscriptions:
+        print(f"\n[Error] No subscriptions found for topic '{args.topic_name}'.", file=sys.stderr)
+        sys.exit(2)
+
+    if len(subscriptions) == 1:
+        selected = subscriptions[0]
+        print(f"Auto-selected sole subscription: {selected['name']}")
+        print(f"(Active: {selected['active']:,} | DLQ: {selected['dlq']:,})\n")
+        return selected["name"]
+
+    print(f"\nAvailable subscriptions for topic '{args.topic_name}':")
+    
+    # Find the longest subscription name so we can align the primary columns
+    max_name_len = max((len(s["name"]) for s in subscriptions), default=0)
+    
+    for idx, sub in enumerate(subscriptions, start=1):
+        name_padded = sub["name"].ljust(max_name_len)
+        base_info = f"  [{idx:2d}] {name_padded}   (Active: {sub['active']:>7,}, DLQ: {sub['dlq']:>5,})"
+        
+        # Only append extra warnings if they are relevant/non-zero to keep the UI clean
+        extras = []
+        if sub["scheduled"] > 0:
+            extras.append(f"Scheduled: {sub['scheduled']:,}")
+        if str(sub["status"]) != "Active":
+            extras.append(f"Status: {sub['status']}")
+        if sub["forward_to"]:
+            # Clean up the forwarding URL to just show the target entity name
+            target = sub["forward_to"].rstrip('/').split('/')[-1]
+            extras.append(f"Forwards to: {target}")
+            
+        if extras:
+            print(f"{base_info}   [{' | '.join(extras)}]")
+        else:
+            print(base_info)
+
+    if not sys.stdin.isatty():
+        print(f"\n[Error] Multiple subscriptions found, but stdin is non-interactive. "
+              f"Please specify '-s / --subscription'.", file=sys.stderr)
+        sys.exit(2)
+
+    while True:
+        try:
+            choice = input(f"\nSelect subscription [1-{len(subscriptions)}]: ").strip()
+            if choice.isdigit():
+                num = int(choice)
+                if 1 <= num <= len(subscriptions):
+                    selected = subscriptions[num - 1]["name"]
+                    print(f"Selected: {selected}\n")
+                    return selected
+            print(f"Invalid choice. Please enter a number between 1 and {len(subscriptions)}.")
+        except (KeyboardInterrupt, EOFError):
+            print("\nOperation cancelled by user.")
+            sys.exit(130)
 
 def get_servicebus_client(args):
     from azure.servicebus import ServiceBusClient
-    fully_qualified_namespace = normalize_namespace(
-        args.namespace
-    )
-    if (
-        args.shared_access_policy_name
-        and args.shared_access_policy_key
-    ):
+    fully_qualified_namespace = normalize_namespace(args.namespace)
+    if args.shared_access_policy_name and args.shared_access_policy_key:
         connection_string = (
             f"Endpoint=sb://{fully_qualified_namespace}/;"
-            f"SharedAccessKeyName="
-            f"{args.shared_access_policy_name};"
-            f"SharedAccessKey="
-            f"{args.shared_access_policy_key}"
+            f"SharedAccessKeyName={args.shared_access_policy_name};"
+            f"SharedAccessKey={args.shared_access_policy_key}"
         )
-        return ServiceBusClient.from_connection_string(
-            connection_string
-        )
+        return ServiceBusClient.from_connection_string(connection_string)
     if args.aad_username:
         from azure.identity import InteractiveBrowserCredential
-        credential = InteractiveBrowserCredential(
-            username=args.aad_username
-        )
+        credential = InteractiveBrowserCredential(username=args.aad_username)
     else:
         from azure.identity import DefaultAzureCredential
         credential = DefaultAzureCredential()
@@ -890,16 +1007,13 @@ def friendly_servicebus_error(exc, args):
                 f"Service Bus operation failed ({type(exc).__name__}).")
     return ("stop", f"Unexpected error ({type(exc).__name__}): {exc}")
 
-
 def show_operational_error(message, exc, debug=False):
     print(f"\n{message}", file=sys.stderr)
     if debug:
         logger.exception("Operation details")
 
-
 class InitialCollectionError(Exception):
     pass
-
 
 def abandon_message(receiver, message):
     try:
@@ -909,21 +1023,21 @@ def abandon_message(receiver, message):
         logger.warning("Unable to abandon message: %s", exc)
         return False
 
-def abandon_pending_messages(receiver,pending_messages):
+def abandon_pending_messages(receiver, pending_messages):
     if not pending_messages:
         return
     print(f"\nAbandoning {len(pending_messages)} outstanding message(s)...")
-    previous_sigint=None
+    previous_sigint = None
     if threading.current_thread() is threading.main_thread():
-        previous_sigint=signal.getsignal(signal.SIGINT)
-        signal.signal(signal.SIGINT,signal.SIG_IGN)
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         for message in list(pending_messages):
-            abandon_message(receiver,message)
+            abandon_message(receiver, message)
         pending_messages.clear()
     finally:
         if previous_sigint is not None:
-            signal.signal(signal.SIGINT,previous_sigint)
+            signal.signal(signal.SIGINT, previous_sigint)
 
 def create_subscription_receiver(client, args):
     return client.get_subscription_receiver(
@@ -932,9 +1046,9 @@ def create_subscription_receiver(client, args):
         prefetch_count=0,
     )
 
-def receive_message_batch(receiver, batch_size, use_peek_lock, sequence_number, wait):
+def receive_message_batch(receiver, batch_size, use_peek_lock, sequence_number, wait_time):
     if use_peek_lock:
-        return receiver.receive_messages(max_message_count=batch_size, max_wait_time=wait)
+        return receiver.receive_messages(max_message_count=batch_size, max_wait_time=wait_time)
     if sequence_number is None:
         return receiver.peek_messages(max_message_count=batch_size)
     return receiver.peek_messages(max_message_count=batch_size, sequence_number=sequence_number)
@@ -958,6 +1072,7 @@ class ProgressReporter:
         self.args = args
         self.interval = interval
         self.last_print = float("-inf")
+
     def update(self, result, count, elapsed, force=False):
         if self.args.debug:
             value = truncate_text(result.get("extracted_value", ""), DEFAULT_DEBUG_VALUE_WIDTH)
@@ -965,7 +1080,13 @@ class ProgressReporter:
         if not force and elapsed - self.last_print < self.interval:
             return
         limit = str(self.args.sample_size) if self.args.sample_size is not None else "unlimited"
-        print_overwrite(f"Collected {count}/{limit} | elapsed {format_elapsed(elapsed)}")
+        
+        elapsed_str = format_elapsed(elapsed)
+        if self.args.duration is not None:
+            expected_seconds = self.args.duration * 60.0
+            elapsed_str += f" / {format_elapsed(expected_seconds)}"
+            
+        print_overwrite(f"Collected {count}/{limit} | elapsed {elapsed_str}")
         self.last_print = elapsed
 
 def fetch_messages(client, args, use_peek_lock):
@@ -989,14 +1110,12 @@ def fetch_messages(client, args, use_peek_lock):
                 stop_reason = "duration reached"
                 break
             batch_size = min(500, args.sample_size - len(messages)) if args.sample_size is not None else 500
-            # Peek-Lock receive is bounded by the remaining collection duration.
-            # Peek API has no timeout argument, so its in-flight call may overrun slightly.
-            wait = min(args.polling, max(0.01, deadline - now)) if deadline is not None else args.polling
+            wait_time = min(args.wait_time, max(0.01, deadline - now)) if deadline is not None else args.wait_time
             try:
                 if receiver is None:
                     receiver = create_subscription_receiver(client, args)
                 batch = receive_message_batch(
-                    receiver, batch_size, use_peek_lock, sequence_number, wait
+                    receiver, batch_size, use_peek_lock, sequence_number, wait_time
                 )
             except KeyboardInterrupt:
                 stop_reason = "interrupted"
@@ -1026,8 +1145,6 @@ def fetch_messages(client, args, use_peek_lock):
                           f"{len(messages):,} messages preserved.", file=sys.stderr)
                     next_outage_notice = now + 60
 
-                # A receiver can remain unusable after a network interruption.
-                # Best-effort release of any locked messages, then recreate it.
                 if receiver is not None:
                     if use_peek_lock and pending_messages:
                         abandon_pending_messages(receiver, pending_messages)
@@ -1058,8 +1175,8 @@ def fetch_messages(client, args, use_peek_lock):
             else:
                 sequence_number = next_peek_sequence_number(batch, sequence_number)
             for message in batch:
-                # A batch can take time to decode; honor the deadline per message.
                 now = time.monotonic()
+                captured_at = utc_now()
                 if deadline is not None and now >= deadline:
                     stop_reason = "duration reached"
                     break
@@ -1067,17 +1184,16 @@ def fetch_messages(client, args, use_peek_lock):
                     stop_reason = "message limit reached"
                     break
                 try:
-                    # Sequence number is stable even when message_id is empty or reused.
                     seq = getattr(message, "sequence_number", None)
                     identity = (("sequence", seq) if seq is not None else
                                 ("id", get_message_id(message)) if get_message_id(message) else
                                 ("object", id(message)))
                     if identity not in seen_sequences:
                         seen_sequences.add(identity)
-                        # Record observation time before potentially expensive decoding.
                         observed_second = now - start
                         result = process_message(message)
                         result["observed_second"] = observed_second
+                        result["captured_at"] = captured_at
                         messages.append(result)
                         progress.update(result, len(messages), time.monotonic() - start)
                 except KeyboardInterrupt:
@@ -1106,36 +1222,36 @@ def fetch_messages(client, args, use_peek_lock):
     return messages, time.monotonic() - start, stop_reason
 
 def parse_args():
-    parser=argparse.ArgumentParser(description="Analyze Azure Service Bus cache invalidation messages.")
+    parser = argparse.ArgumentParser(description="Analyze Azure Service Bus cache invalidation messages.")
     # Connection and authentication.
-    parser.add_argument("-n","--namespace",required=True,help="Service Bus namespace")
-    parser.add_argument("-s","--subscription",dest="subscription_name",required=True,help="Subscription name")
-    parser.add_argument("-t","--topic",dest="topic_name",default="mysiteevents",help="Service Bus topic name")
-    parser.add_argument("-p","--shared-access-policy-name",help="SAS policy name")
-    parser.add_argument("-k","--shared-access-policy-key",help="SAS policy key")
-    parser.add_argument("--aad-username",help="Azure AD username")
+    parser.add_argument("-n", "--namespace", required=True, help="Service Bus namespace")
+    parser.add_argument("-s", "--subscription", dest="subscription_name", default=None, help="Subscription name (auto-discovered if omitted)")
+    parser.add_argument("-t", "--topic", dest="topic_name", default="mysiteevents", help="Service Bus topic name")
+    parser.add_argument("-p", "--shared-access-policy-name", help="SAS policy name")
+    parser.add_argument("-k", "--shared-access-policy-key", help="SAS policy key")
+    parser.add_argument("--aad-username", help="Azure AD username")
     # Normal analysis controls.
-    parser.add_argument("-m","--size",dest="sample_size",type=int,default=None,help="Maximum messages (default: 100 if --duration is omitted)")
-    parser.add_argument("--duration",type=float,default=None,metavar="MINUTES",help="Collect for at most this many minutes")
-    parser.add_argument("-o","--output",help="Write the final analysis report to a file")
-    parser.add_argument("--top",type=int,default=10,help="Maximum groups to display (default: 10; 0 = unlimited)")
-    parser.add_argument("--min-pct",type=float,default=1.0,help="Minimum percentage of analyzed messages to display (default: 1.0; 0 = disabled)")
-    parser.add_argument("--peek",action="store_true",help="Use Peek instead of Peek-Lock")
-    parser.add_argument("--polling",type=int,default=5,help="Receive wait time (default: 5)")
+    parser.add_argument("-m", "--size", dest="sample_size", type=int, default=None, help="Maximum messages (default: 100 if --duration is omitted)")
+    parser.add_argument("--duration", type=float, default=None, metavar="MINUTES", help="Collect for at most this many minutes")
+    parser.add_argument("-o", "--output", help="Write the final analysis report to a file")
+    parser.add_argument("--top", type=int, default=10, help="Maximum groups to display (default: 10; 0 = unlimited)")
+    parser.add_argument("--min-pct", type=float, default=1.0, help="Minimum percentage of analyzed messages to display (default: 1.0; 0 = disabled)")
+    parser.add_argument("--peek", action="store_true", help="Use Peek instead of Peek-Lock")
+    parser.add_argument("-w", "--wait", dest="wait_time", type=float, default=5.0, help="Receive wait time in seconds (default: 5.0)")
     # Pattern grouping controls.
-    parser.add_argument("--no-pattern-grouping",action="store_true",help="Disable pattern grouping")
-    parser.add_argument("--pattern-min-count",type=int,default=3,help="Minimum distinct keys required to form a pattern (default: 3)")
-    parser.add_argument("--pattern-max-wildcards",type=int,default=2,help="Maximum wildcards in a discovered pattern (default: 2)")
+    parser.add_argument("--no-pattern-grouping", action="store_true", help="Disable pattern grouping")
+    parser.add_argument("--pattern-min-count", type=int, default=3, help="Minimum distinct keys required to form a pattern (default: 3)")
+    parser.add_argument("--pattern-max-wildcards", type=int, default=2, help="Maximum wildcards in a discovered pattern (default: 2)")
     # Diagnostics.
-    parser.add_argument("--debug",action="store_true",help="Show debug logging")
-    parser.add_argument("--version",action="version",version=VERSION)
+    parser.add_argument("--debug", action="store_true", help="Show debug logging")
+    parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args()
-    if args.duration is not None and (not __import__("math").isfinite(args.duration) or args.duration <= 0):
+    if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0):
         parser.error("--duration must be a positive finite number")
     if args.sample_size is not None and args.sample_size <= 0:
         parser.error("--size must be positive")
-    if args.polling <= 0:
-        parser.error("--polling must be positive")
+    if args.wait_time <= 0:
+        parser.error("--wait must be positive")
     if args.sample_size is None and args.duration is None:
         args.sample_size = 100
     return args
@@ -1155,22 +1271,15 @@ def main():
         ),
     )
     ensure_dependencies()
+
+    if args.subscription_name is None:
+        args.subscription_name = discover_and_select_subscription(args)
+
     collection_started = utc_now()
-    print(
-        f"Namespace: "
-        f"{normalize_namespace(args.namespace)}"
-    )
-    print(
-        f"Topic: {args.topic_name}"
-    )
-    print(
-        f"Subscription: "
-        f"{args.subscription_name}"
-    )
-    print(
-        f"Mode: "
-        f"{'Peek' if args.peek else 'Peek-Lock'}\n"
-    )
+    print(f"Namespace: {normalize_namespace(args.namespace)}")
+    print(f"Topic: {args.topic_name}")
+    print(f"Subscription: {args.subscription_name}")
+    print(f"Mode: {'Peek' if args.peek else 'Peek-Lock'}\n")
     client = None
     try:
         client = get_servicebus_client(args)
@@ -1179,17 +1288,10 @@ def main():
         )
         groups = group_messages(
             messages,
-            pattern_grouping=(
-                not args.no_pattern_grouping
-            ),
-            pattern_min_count=(
-                args.pattern_min_count
-            ),
-            pattern_max_wildcards=(
-                args.pattern_max_wildcards
-            ),
+            pattern_grouping=(not args.no_pattern_grouping),
+            pattern_min_count=args.pattern_min_count,
+            pattern_max_wildcards=args.pattern_max_wildcards,
         )
-        # Capture rate measures this analyzer's collection speed, not the real consumer.
         capture_rate = len(messages) / collection_elapsed if collection_elapsed > 0 else 0.0
         capture_section = (f"Analyzer capture rate: {capture_rate:.2f} messages/s "
                            f"({len(messages):,} unique messages / {format_elapsed(collection_elapsed)} collection time)\n"
@@ -1217,42 +1319,30 @@ def main():
             try:
                 client.close()
             except Exception:
-                logger.exception(
-                    "Error closing client"
-                )
+                logger.exception("Error closing client")
     collection_ended = utc_now()
-    elapsed = (
-        collection_ended - collection_started
-    ).total_seconds()
+    elapsed = (collection_ended - collection_started).total_seconds()
     print()
-    print(
-        f"Collection started:    "
-        f"{format_timestamp(collection_started)} UTC"
-    )
-    print(
-        f"Collection ended:    "
-        f"{format_timestamp(collection_ended)} UTC"
-    )
-    print(
-        f"Collection time:     "
-        f"{format_elapsed(elapsed)}"
-    )
+    print(f"Collection started:    {format_timestamp(collection_started)} UTC")
+    print(f"Collection ended:      {format_timestamp(collection_ended)} UTC")
+    print(f"Collection time:       {format_elapsed(elapsed)}")
     if args.output:
         try:
             write_output_file(
-            args.output,
-            file_report,
-            collection_started,
-            collection_ended,
-            elapsed,
-            args,
-            len(messages),
-            stop_reason,
+                args.output,
+                file_report,
+                collection_started,
+                collection_ended,
+                elapsed,
+                args,
+                len(messages),
+                stop_reason,
             )
         except OSError as exc:
             show_operational_error(f"Could not write report '{args.output}': {exc}", exc, args.debug)
             return 3
         print(f"Output written to: {args.output}")
     return 1 if stop_reason.startswith("collection aborted:") else 0
+
 if __name__ == "__main__":
     sys.exit(main())
