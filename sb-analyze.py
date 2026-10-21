@@ -20,27 +20,30 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict, Counter
 from datetime import datetime, timezone, timedelta
 
-VERSION = "2.3.0"
-DEFAULT_KEY_WIDTH = 45
+VERSION = "2.4.0"
+DEFAULT_KEY_WIDTH = 80
 DEFAULT_COUNT_WIDTH = 7
 DEFAULT_PROGRESS_WIDTH = 95
 DEFAULT_DEBUG_VALUE_WIDTH = 160
 logger = logging.getLogger(__name__)
 
-# Pre-compiled Regexes for Performance
-RE_GUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-RE_HEX = re.compile(r"^[0-9a-fA-F]{8,}$")
-RE_HYPHEN_DIGITS = re.compile(r"^\d+(?:-\d+)+$")
-RE_WILDCARD_SUFFIX = re.compile(r"(.+?[:_/|])([^:/_|]+)")
-RE_DIGITS_3 = re.compile(r"\d{3,}")
-RE_SUFFIX_ALPHA = re.compile(r"[A-Za-z]")
-RE_PREFIX_HYPHEN_DIGITS = re.compile(r"(.+?[_-])(\d{3,})")
-RE_PREFIX_ALPHA_DIGITS = re.compile(r"(.+?[A-Za-z])(\d{3,})")
-RE_COMPLEX_PATTERN = re.compile(r"(.+?[:_/|])([^:/_|]+)([:_/|])(.+?)(__[A-Za-z][A-Za-z0-9_]*)")
+# Structural / Identifier Regexes
 RE_DOTNET_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_`+]*$")
 RE_PRINTABLE_ASCII = re.compile(rb"[\x20-\x7e]{4,}")
 RE_NON_ALPHANUM = re.compile(r"[^A-Za-z0-9]")
 RE_WHITESPACE = re.compile(r"\s+")
+
+# Dynamic Suffix Protection Regex (Culture Codes, GUIDs, and Numeric IDs)
+RE_DYNAMIC_SUFFIX = re.compile(
+    r"^[a-z]{2,3}(-[A-Za-z0-9]+)+$|"  # Culture codes (zh-Hans, en-US, sv-SE)
+    r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$|"  # GUIDs
+    r"^\d+$"  # Pure integer IDs
+)
+
+# High-Entropy Token Type Inspection Regexes
+RE_GUID = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+RE_INTEGER_ID = re.compile(r"^\d+$")
+RE_HASH = re.compile(r"^[0-9a-fA-F]{32,64}$")
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -52,25 +55,16 @@ def ensure_package(package_name, import_name=None):
         __import__(import_name)
         return
     except ImportError as e:
-        print(
-            f"Import failed for '{import_name}': {e}",
-            file=sys.stderr,
-        )
+        print(f"Import failed for '{import_name}': {e}", file=sys.stderr)
     print(f"Installing missing package: {package_name}")
-    subprocess.check_call([
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        package_name,
-    ])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
 
 def ensure_dependencies():
     ensure_package("azure-servicebus", "azure.servicebus")
     ensure_package("azure-identity", "azure.identity")
     ensure_package("wcf", "wcf")
     try:
-        get_wcf_decoder()  # Import and register WCF records once.
+        get_wcf_decoder()
     except ImportError:
         logger.exception("Unable to initialize the WCF binary parser")
         raise
@@ -87,9 +81,7 @@ def format_timestamp(value):
     if isinstance(value, datetime):
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     return str(value)
 
 def normalize_namespace(namespace):
@@ -103,7 +95,7 @@ def print_overwrite(text, width=DEFAULT_PROGRESS_WIDTH):
     print(f"\r{text:<{width}}", end="", flush=True)
 
 # ---------------------------------------------------------------------------
-# Message body
+# Message Body & Deserialization
 # ---------------------------------------------------------------------------
 def get_message_body_bytes(message):
     try:
@@ -122,24 +114,11 @@ def get_message_body_bytes(message):
         logger.exception("Unable to extract message body")
         return b""
 
-# ---------------------------------------------------------------------------
-# JSON handling
-# ---------------------------------------------------------------------------
 def find_cache_key_in_json(value):
     if isinstance(value, dict):
-        preferred_names = (
-            "cacheKey",
-            "cache_key",
-            "CacheKey",
-            "key",
-            "Key",
-            "cachekey",
-        )
+        preferred_names = ("cacheKey", "cache_key", "CacheKey", "key", "Key", "cachekey")
         for name in preferred_names:
-            if name in value and isinstance(
-                value[name],
-                str,
-            ):
+            if name in value and isinstance(value[name], str):
                 return value[name]
         for child in value.values():
             result = find_cache_key_in_json(child)
@@ -154,39 +133,17 @@ def find_cache_key_in_json(value):
 
 def handle_json_message(body_bytes):
     try:
-        text = body_bytes.decode(
-            "utf-8",
-            errors="strict",
-        )
+        text = body_bytes.decode("utf-8", errors="strict")
         data = json.loads(text)
         value = find_cache_key_in_json(data)
         if value:
-            return {
-                "format": "JSON",
-                "extracted_value": value,
-            }
-        return {
-            "format": "JSON",
-            "extracted_value": "[No cache key in JSON]",
-        }
+            return {"format": "JSON", "extracted_value": value}
+        return {"format": "JSON", "extracted_value": "[No cache key in JSON]"}
     except Exception:
-        return {
-            "format": "JSON",
-            "extracted_value": "[Invalid JSON]",
-        }
+        return {"format": "JSON", "extracted_value": "[Invalid JSON]"}
 
-# ---------------------------------------------------------------------------
-# XML handling
-# ---------------------------------------------------------------------------
 def find_cache_key_in_xml(element):
-    preferred_names = {
-        "cachekey",
-        "cache_key",
-        "key",
-        "cache",
-        "cacheid",
-        "cacheidentifier",
-    }
+    preferred_names = {"cachekey", "cache_key", "key", "cache", "cacheid", "cacheidentifier"}
     tag_name = element.tag
     if isinstance(tag_name, str):
         if "}" in tag_name:
@@ -197,10 +154,7 @@ def find_cache_key_in_xml(element):
     for name, value in element.attrib.items():
         attribute_name = name
         if "}" in attribute_name:
-            attribute_name = attribute_name.rsplit(
-                "}",
-                1,
-            )[1]
+            attribute_name = attribute_name.rsplit("}", 1)[1]
         if attribute_name.lower() in preferred_names:
             if value:
                 return value
@@ -215,23 +169,11 @@ def handle_xml_message(body_bytes):
         root = ET.fromstring(body_bytes)
         value = find_cache_key_in_xml(root)
         if value:
-            return {
-                "format": "XML",
-                "extracted_value": value,
-            }
-        return {
-            "format": "XML",
-            "extracted_value": "[No cache key in XML]",
-        }
+            return {"format": "XML", "extracted_value": value}
+        return {"format": "XML", "extracted_value": "[No cache key in XML]"}
     except Exception:
-        return {
-            "format": "XML",
-            "extracted_value": "[Invalid XML]",
-        }
+        return {"format": "XML", "extracted_value": "[Invalid XML]"}
 
-# ---------------------------------------------------------------------------
-# WCF Binary XML handling
-# ---------------------------------------------------------------------------
 WCF_FORMAT = "WCF Binary XML"
 
 def local_xml_name(name):
@@ -240,7 +182,6 @@ def local_xml_name(name):
 
 @lru_cache(maxsize=1)
 def get_wcf_decoder():
-    """Resolve WCF parser once, not once for every message."""
     from wcf.records.base import Record
     from wcf.records import print_records
     import wcf.records.text  # noqa: F401
@@ -256,14 +197,9 @@ def decode_wcf_xml(body_bytes):
     return output.getvalue()
 
 def parse_wcf_xml(xml_text):
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("=== Decoded WCF XML Output ===")
-        logger.debug(xml_text)
-        logger.debug("===============================")
     try:
         return ET.fromstring(xml_text)
-    except ET.ParseError as e:
-        logger.debug("WCF decoded but XML parsing failed: %s", e)
+    except ET.ParseError:
         return None
 
 def find_wcf_parameter(root):
@@ -421,7 +357,6 @@ def extract_xml_child(parameter, field):
     return None
 
 def extract_wcf_parameter(parameter):
-    """Return (source label, extracted value) using the configured rule."""
     parameter_type = get_parameter_type(parameter)
     rule = MESSAGE_EXTRACTORS.get(get_parameter_type_name(parameter_type))
     if rule is None:
@@ -441,12 +376,10 @@ def extract_wcf_parameter(parameter):
     return rule["label"], value or rule["fallback"]
 
 def handle_wcf_binary_message(body_bytes):
-    """Validate WCF by parsing records once; never label arbitrary bytes WCF."""
     try:
         xml_text = decode_wcf_xml(body_bytes)
         root = parse_wcf_xml(xml_text)
     except Exception:
-        logger.debug("WCF Binary XML parsing failed", exc_info=True)
         return {"format": "Unknown Binary", "extracted_value": "[Unrecognized binary format]"}
     if root is None:
         return {"format": "Unknown Binary", "extracted_value": "[Invalid decoded XML]"}
@@ -457,14 +390,9 @@ def handle_wcf_binary_message(body_bytes):
         kind, value = extract_wcf_parameter(parameter)
         return {"format": WCF_FORMAT, "extracted_value": value, "value_kind": kind}
     except Exception:
-        logger.debug("WCF parameter extraction failed", exc_info=True)
         return {"format": WCF_FORMAT, "extracted_value": "[Extraction error]", "value_kind": "OtherParameter"}
 
-# ---------------------------------------------------------------------------
-# Format detection and dispatch
-# ---------------------------------------------------------------------------
 def detect_format(body_bytes):
-    """Recognize textual candidates; binary content requires actual parsing."""
     if not body_bytes:
         return "empty"
     stripped = body_bytes.lstrip(b" \t\r\n")
@@ -489,27 +417,16 @@ def handle_message_body(body_bytes):
 def process_message(message):
     body_bytes = get_message_body_bytes(message)
     result = handle_message_body(body_bytes)
-    result["message_id"] = str(
-        getattr(message, "message_id", "") or ""
-    )
-    result["sequence_number"] = getattr(
-        message,
-        "sequence_number",
-        None,
-    )
-    result["enqueued_time"] = getattr(
-        message,
-        "enqueued_time_utc",
-        None,
-    )
+    result["message_id"] = str(getattr(message, "message_id", "") or "")
+    result["sequence_number"] = getattr(message, "sequence_number", None)
+    result["enqueued_time"] = getattr(message, "enqueued_time_utc", None)
     result["body_size"] = len(body_bytes)
     return result
 
 # ---------------------------------------------------------------------------
-# Risk calculation & Fast Pattern Matching / Grouping
+# Type-Aware Structural Grouping
 # ---------------------------------------------------------------------------
 def calculate_age_seconds(enqueued_time, captured_at=None):
-    """Calculate queue latency relative to capture time, not post-processing report time."""
     if not enqueued_time:
         return None
     try:
@@ -523,7 +440,6 @@ def calculate_age_seconds(enqueued_time, captured_at=None):
         return None
 
 def format_elapsed(seconds):
-    """Format a duration as hours:minutes:seconds.milliseconds."""
     total_ms = max(0, round(seconds * 1000))
     hours, remainder = divmod(total_ms, 3_600_000)
     minutes, remainder = divmod(remainder, 60_000)
@@ -533,110 +449,96 @@ def format_elapsed(seconds):
 def format_age(seconds):
     if seconds is None:
         return "-"
-    if seconds<60:
+    if seconds < 60:
         return f"{seconds:.1f}s"
-    if seconds<3600:
-        minutes=int(seconds//60)
-        secs=int(seconds%60)
+    if seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
         return f"{minutes}m {secs:02d}s"
-    if seconds<86400:
-        hours=int(seconds//3600)
-        minutes=int((seconds%3600)//60)
+    if seconds < 86400:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
         return f"{hours}h {minutes:02d}m"
-    days=int(seconds//86400)
-    hours=int((seconds%86400)//3600)
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
     return f"{days}d {hours:02d}h"
-
-def is_variable_component(value):
-    if not value:
-        return False
-    if value.isdigit():
-        return True
-    if RE_GUID.fullmatch(value):
-        return True
-    if RE_HEX.fullmatch(value) and any(ch.isdigit() for ch in value):
-        return True
-    if RE_HYPHEN_DIGITS.fullmatch(value):
-        return True
-    return False
 
 def fixed_pattern_chars(pattern):
     return len(RE_NON_ALPHANUM.sub("", pattern.replace("*", "")))
 
-def wildcard_component(value):
-    if is_variable_component(value):
-        return "*"
-    match = RE_PREFIX_HYPHEN_DIGITS.fullmatch(value)
-    if match:
-        return f"{match.group(1)}*"
-    return None
+def is_high_entropy_value(val: str) -> bool:
+    """Check if a token looks like a dynamic identifier (GUID, integer ID, hash)."""
+    val = str(val).strip()
+    return bool(RE_GUID.match(val) or RE_INTEGER_ID.match(val) or RE_HASH.match(val))
 
-def pattern_candidates_for_value(value, max_wildcards):
-    candidates = set()
-    parts = value.split(":")
-    variable_parts = []
-    for index, part in enumerate(parts):
-        wildcarded = wildcard_component(part)
-        if wildcarded:
-            variable_parts.append((index, wildcarded))
-    for index, wildcarded in variable_parts:
-        candidate = parts.copy()
-        candidate[index] = wildcarded
-        candidates.add(":".join(candidate))
-    if max_wildcards >= 2:
-        for left in range(len(variable_parts)):
-            for right in range(left + 1, len(variable_parts)):
-                candidate = parts.copy()
-                left_index, left_value = variable_parts[left]
-                right_index, right_value = variable_parts[right]
-                candidate[left_index] = left_value
-                candidate[right_index] = right_value
-                candidates.add(":".join(candidate))
-    match = RE_WILDCARD_SUFFIX.fullmatch(value)
-    if match and is_variable_component(match.group(2)):
-        candidates.add(f"{match.group(1)}*")
-    for match in RE_DIGITS_3.finditer(value):
-        prefix = value[:match.start()]
-        suffix = value[match.end():]
-        if suffix and RE_SUFFIX_ALPHA.search(suffix):
-            candidates.add(f"{prefix}*{suffix}")
-    match = RE_PREFIX_HYPHEN_DIGITS.fullmatch(value)
-    if match:
-        candidates.add(f"{match.group(1)}*")
-    match = RE_PREFIX_ALPHA_DIGITS.fullmatch(value)
-    if match:
-        candidates.add(f"{match.group(1)}*")
-    if max_wildcards >= 2:
-        match = RE_COMPLEX_PATTERN.fullmatch(value)
-        if match and is_variable_component(match.group(2)):
-            candidates.add(f"{match.group(1)}*{match.group(3)}*{match.group(5)}")
-    return candidates
+def get_slot_min_support(slot_values: set, term_support: int = 5) -> int:
+    """Dynamically set support threshold based on token entropy type."""
+    if not slot_values:
+        return term_support
+    high_entropy_count = sum(1 for v in slot_values if is_high_entropy_value(v))
+    # If majority of values are GUIDs/numeric IDs, collapse immediately
+    if high_entropy_count / len(slot_values) >= 0.5:
+        return 1
+    # For descriptive terms, culture codes, and enums, require higher variation before collapsing
+    return term_support
 
-def discover_patterns(values, min_support=3, max_wildcards=2, show_progress=True):
-    values = list(dict.fromkeys(values))
-    total = len(values)
-    if total < min_support:
+def split_key_structure(value):
+    """Split key strictly on primary namespace delimiters while protecting dynamic suffixes."""
+    parts = re.split(r"([:/|])", value)
+    if parts and RE_DYNAMIC_SUFFIX.match(parts[-1]):
+        return parts
+    return parts
+
+def discover_patterns(exact_groups, pattern_term_min_count=5, show_progress=True):
+    """Group keys by structural template depth and collapse slots using Type-Aware Cardinality."""
+    string_entries = [(v, len(msgs)) for (kind, v), msgs in exact_groups.items() if kind == "String"]
+    if not string_entries:
         return []
-    candidate_values = defaultdict(set)
-    for index, value in enumerate(values, 1):
-        for pattern in pattern_candidates_for_value(value, max_wildcards):
-            if pattern.count("*") <= max_wildcards and fixed_pattern_chars(pattern) >= 3:
-                candidate_values[pattern].add(value)
-        if show_progress and (index == total or index % 100 == 0):
-            print_overwrite(f"Discovering patterns {index}/{total}")
-    if show_progress:
-        print()
+
+    values = [item[0] for item in string_entries]
+
+    templates = defaultdict(list)
+    for value in values:
+        parts = split_key_structure(value)
+        template_key = (len(parts), tuple(parts[1::2]))
+        templates[template_key].append((value, parts))
+
     patterns = []
-    for pattern, matched in candidate_values.items():
-        if len(matched) < min_support:
-            continue
-        patterns.append({
-            "pattern": pattern,
-            "values": matched,
-            "wildcards": pattern.count("*"),
-            "fixed_chars": fixed_pattern_chars(pattern),
-        })
-    patterns.sort(key=lambda item: (item["wildcards"], -item["fixed_chars"], -len(item["values"]), item["pattern"]))
+    
+    for (num_parts, _), items in templates.items():
+        token_indices = list(range(0, num_parts, 2))
+        
+        prefix_groups = defaultdict(list)
+        for value, parts in items:
+            prefix = parts[0] if num_parts > 1 else value
+            prefix_groups[prefix].append((value, parts))
+
+        for prefix, p_items in prefix_groups.items():
+            slot_unique = defaultdict(set)
+            for value, parts in p_items:
+                for idx in token_indices:
+                    slot_unique[idx].add(parts[idx])
+
+            cp = p_items[0][1].copy()
+            has_wildcard = False
+            
+            for idx in token_indices:
+                slot_vals = slot_unique[idx]
+                min_req = get_slot_min_support(slot_vals, term_support=pattern_term_min_count)
+                if len(slot_vals) >= min_req:
+                    cp[idx] = "*"
+                    has_wildcard = True
+
+            if has_wildcard:
+                pattern_str = "".join(cp)
+                patterns.append({
+                    "pattern": pattern_str,
+                    "values": {val for val, _ in p_items},
+                    "wildcards": pattern_str.count("*"),
+                    "fixed_chars": fixed_pattern_chars(pattern_str),
+                })
+
+    patterns.sort(key=lambda item: (-item["fixed_chars"], item["pattern"]))
     return patterns
 
 def normalize_enqueue_time(value):
@@ -681,45 +583,41 @@ def build_exact_group_results(exact_groups):
         for (kind, value), messages in exact_groups.items()
     ])
 
-def pattern_specificity(pattern):
-    text = pattern["pattern"]
-    return (
-        pattern["wildcards"],
-        -pattern["fixed_chars"],
-        -len(text),
-        text,
-    )
-
-def build_pattern_group_results(exact_groups, patterns, pattern_min_count=2):
+def build_pattern_group_results(exact_groups, patterns):
     groups = []
     represented_values = set()
-    for pattern in sorted(patterns, key=pattern_specificity):
+
+    for pattern in patterns:
         available_values = [v for v in pattern["values"] if v not in represented_values]
-        if len(available_values) < pattern_min_count:
+        if not available_values:
             continue
+            
         messages = []
         for value in available_values:
             messages.extend(exact_groups.get(("String", value), []))
+            
         represented_values.update(available_values)
         groups.append(message_group_result(pattern["pattern"], messages, "String"))
+
     for (kind, value), messages in exact_groups.items():
-        if kind != "String" or value not in represented_values:
-            groups.append(message_group_result(value, messages, kind))
+        if kind == "String" and value in represented_values:
+            continue
+        groups.append(message_group_result(value, messages, kind))
+
     return sort_message_groups(groups)
 
-def group_messages(messages, pattern_grouping=True, pattern_min_count=2, pattern_max_wildcards=2):
+def group_messages(messages, pattern_grouping=True, pattern_term_min_count=5):
     exact_groups = build_exact_groups(messages)
     if not exact_groups:
         return []
     if not pattern_grouping:
         return build_exact_group_results(exact_groups)
-    string_values = [value for kind, value in exact_groups if kind == "String"]
+        
     patterns = discover_patterns(
-        string_values,
-        min_support=pattern_min_count,
-        max_wildcards=pattern_max_wildcards
-    ) if string_values else []
-    return build_pattern_group_results(exact_groups, patterns, pattern_min_count)
+        exact_groups,
+        pattern_term_min_count=pattern_term_min_count,
+    )
+    return build_pattern_group_results(exact_groups, patterns)
 
 def truncate_text(value, width):
     value = str(value)
@@ -741,14 +639,16 @@ def build_analysis_report(groups, total_messages, min_pct=1.0, top=10, full_valu
     displayed = eligible if top <= 0 else eligible[:top]
     if not displayed:
         return f"No groups meet the minimum {min_pct:.2f}% threshold.\nAnalyzed messages: {total_messages}"
+    
     key_width = max(DEFAULT_KEY_WIDTH, *(len(str(g["key"])) for g in displayed)) if full_values else DEFAULT_KEY_WIDTH
     pct_width = 13
     age_width = 10
     kind_width = 19
-    lines = [
-        f"{'Count':>{DEFAULT_COUNT_WIDTH}} | {'% of messages':>{pct_width}} | {'Source':<{kind_width}} | {'Value / Pattern':<{key_width}} | {'Avg age':>{age_width}}",
-        f"{'-'*DEFAULT_COUNT_WIDTH}-+-{'-'*pct_width}-+-{'-'*kind_width}-+-{'-'*key_width}-+-{'-'*age_width}",
-    ]
+    
+    header = f"{'Count':>{DEFAULT_COUNT_WIDTH}} | {'% of messages':>{pct_width}} | {'Source':<{kind_width}} | {'Value / Pattern':<{key_width}} | {'Avg age':>{age_width}}"
+    divider = f"{'-'*DEFAULT_COUNT_WIDTH}-+-{'-'*pct_width}-+-{'-'*kind_width}-+-{'-'*key_width}-+-{'-'*age_width}"
+    
+    lines = [header, divider]
     displayed_count = 0
     for group in displayed:
         count = group["count"]
@@ -809,12 +709,16 @@ def build_throughput_report(messages, groups, elapsed, top, full_values=False):
             (f"  (partial {width:.0f}s)" if width < 60 else "")
         )
         minute_start += timedelta(minutes=1)
+
+    displayed = groups if top <= 0 else groups[:top]
+    actual_key_width = max(DEFAULT_KEY_WIDTH, *(len(str(g["key"])) for g in displayed)) if (full_values and displayed) else DEFAULT_KEY_WIDTH
+    per_source_divider_len = 10 + 3 + 11 + 3 + 11 + 3 + 19 + 3 + actual_key_width
+
     lines += [
         "", "Per source / value (sampled enqueue-time rates)",
         f"{'Count':>10} | {'Avg msg/s':>11} | {'Peak msg/s':>11} | {'Source':<19} | Value / Pattern",
-        "-" * 112
+        "-" * per_source_divider_len
     ]
-    displayed = groups if top <= 0 else groups[:top]
     for group in displayed:
         group_times = [t for t in group["enqueued_times"] if t is not None]
         group_seconds = Counter(int((t - start).total_seconds()) for t in group_times)
@@ -822,7 +726,7 @@ def build_throughput_report(messages, groups, elapsed, top, full_values=False):
         lines.append(
             f"{len(group_times):>10,} | {len(group_times)/span:>11.2f} | "
             f"{group_peak:>11,} | {truncate_text(group['kind'], 19):<19} | "
-            f"{str(group['key']) if full_values else truncate_text(group['key'], DEFAULT_KEY_WIDTH)}"
+            f"{str(group['key']) if full_values else truncate_text(group['key'], actual_key_width)}"
         )
     lines += [
         "", "Rates are based on enqueued_time_utc, including older captured messages.",
@@ -885,8 +789,6 @@ def discover_and_select_subscription(args):
                 active = 0
                 dlq = 0
                 scheduled = 0
-                
-                # Extract counts safely from the SDK's MessageCountDetails object
                 counts = getattr(sub, "count_details", getattr(sub, "message_count_details", None))
                 if counts:
                     active = getattr(counts, "active_message_count", 0)
@@ -917,22 +819,17 @@ def discover_and_select_subscription(args):
         return selected["name"]
 
     print(f"\nAvailable subscriptions for topic '{args.topic_name}':")
-    
-    # Find the longest subscription name so we can align the primary columns
     max_name_len = max((len(s["name"]) for s in subscriptions), default=0)
     
     for idx, sub in enumerate(subscriptions, start=1):
         name_padded = sub["name"].ljust(max_name_len)
         base_info = f"  [{idx:2d}] {name_padded}   (Active: {sub['active']:>7,}, DLQ: {sub['dlq']:>5,})"
-        
-        # Only append extra warnings if they are relevant/non-zero to keep the UI clean
         extras = []
         if sub["scheduled"] > 0:
             extras.append(f"Scheduled: {sub['scheduled']:,}")
         if str(sub["status"]) != "Active":
             extras.append(f"Status: {sub['status']}")
         if sub["forward_to"]:
-            # Clean up the forwarding URL to just show the target entity name
             target = sub["forward_to"].rstrip('/').split('/')[-1]
             extras.append(f"Forwards to: {target}")
             
@@ -982,7 +879,6 @@ def get_servicebus_client(args):
     )
 
 def friendly_servicebus_error(exc, args):
-    """Classify SDK errors without depending on exception-message wording."""
     from azure.servicebus.exceptions import (
         MessagingEntityNotFoundError, ServiceBusAuthenticationError,
         ServiceBusAuthorizationError, ServiceBusConnectionError,
@@ -1019,8 +915,8 @@ def abandon_message(receiver, message):
     try:
         receiver.abandon_message(message)
         return True
-    except Exception as exc:
-        logger.warning("Unable to abandon message: %s", exc)
+    except (AttributeError, Exception) as exc:
+        logger.debug("Unable to abandon message during cleanup: %s", exc)
         return False
 
 def abandon_pending_messages(receiver, pending_messages):
@@ -1067,7 +963,6 @@ def release_pending_message(receiver, message, pending_messages):
         pending_messages.remove(message)
 
 class ProgressReporter:
-    """Limit terminal writes; --debug still prints individual decoded messages."""
     def __init__(self, args, interval=0.5):
         self.args = args
         self.interval = interval
@@ -1223,14 +1118,12 @@ def fetch_messages(client, args, use_peek_lock):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Analyze Azure Service Bus cache invalidation messages.")
-    # Connection and authentication.
     parser.add_argument("-n", "--namespace", required=True, help="Service Bus namespace")
     parser.add_argument("-s", "--subscription", dest="subscription_name", default=None, help="Subscription name (auto-discovered if omitted)")
     parser.add_argument("-t", "--topic", dest="topic_name", default="mysiteevents", help="Service Bus topic name")
-    parser.add_argument("-p", "--shared-access-policy-name", help="SAS policy name")
+    parser.add_argument("-p", "--shared-access-policy-name", default="test", help="SAS policy name")
     parser.add_argument("-k", "--shared-access-policy-key", help="SAS policy key")
     parser.add_argument("--aad-username", help="Azure AD username")
-    # Normal analysis controls.
     parser.add_argument("-m", "--size", dest="sample_size", type=int, default=None, help="Maximum messages (default: 100 if --duration is omitted)")
     parser.add_argument("--duration", type=float, default=None, metavar="MINUTES", help="Collect for at most this many minutes")
     parser.add_argument("-o", "--output", help="Write the final analysis report to a file")
@@ -1238,11 +1131,8 @@ def parse_args():
     parser.add_argument("--min-pct", type=float, default=1.0, help="Minimum percentage of analyzed messages to display (default: 1.0; 0 = disabled)")
     parser.add_argument("--peek", action="store_true", help="Use Peek instead of Peek-Lock")
     parser.add_argument("-w", "--wait", dest="wait_time", type=float, default=5.0, help="Receive wait time in seconds (default: 5.0)")
-    # Pattern grouping controls.
     parser.add_argument("--no-pattern-grouping", action="store_true", help="Disable pattern grouping")
-    parser.add_argument("--pattern-min-count", type=int, default=3, help="Minimum distinct keys required to form a pattern (default: 3)")
-    parser.add_argument("--pattern-max-wildcards", type=int, default=2, help="Maximum wildcards in a discovered pattern (default: 2)")
-    # Diagnostics.
+    parser.add_argument("--pattern-term-min-count", type=int, default=5, help="Minimum distinct text terms required to collapse a text slot (default: 5)")
     parser.add_argument("--debug", action="store_true", help="Show debug logging")
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args()
@@ -1259,16 +1149,8 @@ def parse_args():
 def main():
     args = parse_args()
     logging.basicConfig(
-        level=(
-            logging.DEBUG
-            if args.debug
-            else logging.ERROR
-        ),
-        format=(
-            "%(asctime)s "
-            "%(levelname)s "
-            "%(message)s"
-        ),
+        level=logging.DEBUG if args.debug else logging.ERROR,
+        format="%(asctime)s %(levelname)s %(message)s",
     )
     ensure_dependencies()
 
@@ -1289,8 +1171,7 @@ def main():
         groups = group_messages(
             messages,
             pattern_grouping=(not args.no_pattern_grouping),
-            pattern_min_count=args.pattern_min_count,
-            pattern_max_wildcards=args.pattern_max_wildcards,
+            pattern_term_min_count=args.pattern_term_min_count,
         )
         capture_rate = len(messages) / collection_elapsed if collection_elapsed > 0 else 0.0
         capture_section = (f"Analyzer capture rate: {capture_rate:.2f} messages/s "
