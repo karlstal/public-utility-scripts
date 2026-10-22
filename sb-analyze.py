@@ -8,6 +8,7 @@ import base64
 import binascii
 import json
 import io
+import os
 import math
 from functools import lru_cache
 import logging
@@ -20,7 +21,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict, Counter
 from datetime import datetime, timezone, timedelta
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 DEFAULT_KEY_WIDTH = 80
 DEFAULT_COUNT_WIDTH = 7
 DEFAULT_PROGRESS_WIDTH = 95
@@ -40,10 +41,12 @@ RE_DYNAMIC_SUFFIX = re.compile(
     r"^\d+$"  # Pure integer IDs
 )
 
-# High-Entropy Token Type Inspection Regexes
-RE_GUID = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
-RE_INTEGER_ID = re.compile(r"^\d+$")
-RE_HASH = re.compile(r"^[0-9a-fA-F]{32,64}$")
+# Universal Entropy Inspection Regexes
+RE_LOW_ENTROPY_TEXT = re.compile(r"^[A-Za-z_]+(-[A-Za-z0-9]+)?$")
+RE_HIGH_ENTROPY_ID = re.compile(
+    r"^\d+$|"                                  # Pure integers
+    r"^(?=.*\d)[A-Za-z0-9_-]{6,}$"             # Alphanumeric mix >= 6 chars with at least one digit
+)
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -467,30 +470,30 @@ def fixed_pattern_chars(pattern):
     return len(RE_NON_ALPHANUM.sub("", pattern.replace("*", "")))
 
 def is_high_entropy_value(val: str) -> bool:
-    """Check if a token looks like a dynamic identifier (GUID, integer ID, hash)."""
     val = str(val).strip()
-    return bool(RE_GUID.match(val) or RE_INTEGER_ID.match(val) or RE_HASH.match(val))
+    return bool(RE_HIGH_ENTROPY_ID.match(val))
 
 def get_slot_min_support(slot_values: set, term_support: int = 5) -> int:
-    """Dynamically set support threshold based on token entropy type."""
     if not slot_values:
         return term_support
+
+    text_count = sum(1 for v in slot_values if RE_LOW_ENTROPY_TEXT.match(str(v).strip()))
+    if text_count / len(slot_values) >= 0.5:
+        return term_support
+
     high_entropy_count = sum(1 for v in slot_values if is_high_entropy_value(v))
-    # If majority of values are GUIDs/numeric IDs, collapse immediately
     if high_entropy_count / len(slot_values) >= 0.5:
         return 1
-    # For descriptive terms, culture codes, and enums, require higher variation before collapsing
+
     return term_support
 
 def split_key_structure(value):
-    """Split key strictly on primary namespace delimiters while protecting dynamic suffixes."""
     parts = re.split(r"([:/|])", value)
     if parts and RE_DYNAMIC_SUFFIX.match(parts[-1]):
         return parts
     return parts
 
 def discover_patterns(exact_groups, pattern_term_min_count=5, show_progress=True):
-    """Group keys by structural template depth and collapse slots using Type-Aware Cardinality."""
     string_entries = [(v, len(msgs)) for (kind, v), msgs in exact_groups.items() if kind == "String"]
     if not string_entries:
         return []
@@ -755,7 +758,7 @@ def write_output_file(filename, report, collection_started, collection_ended, el
         output_file.write("\n".join(lines))
 
 # ---------------------------------------------------------------------------
-# Management & Auto-Discovery
+# Management & Auto-Discovery with Activity Inspection
 # ---------------------------------------------------------------------------
 def get_servicebus_admin_client(args):
     from azure.servicebus.management import ServiceBusAdministrationClient
@@ -784,24 +787,19 @@ def discover_and_select_subscription(args):
         admin_client = get_servicebus_admin_client(args)
         subscriptions = []
         with admin_client:
-            sub_properties = admin_client.list_subscriptions(topic_name=args.topic_name)
-            for sub in sub_properties:
-                active = 0
-                dlq = 0
-                scheduled = 0
-                counts = getattr(sub, "count_details", getattr(sub, "message_count_details", None))
-                if counts:
-                    active = getattr(counts, "active_message_count", 0)
-                    dlq = getattr(counts, "dead_letter_message_count", 0)
-                    scheduled = getattr(counts, "scheduled_message_count", 0)
+            sub_runtime_properties = admin_client.list_subscriptions_runtime_properties(topic_name=args.topic_name)
+            for sub in sub_runtime_properties:
+                active = getattr(sub, "active_message_count", 0)
+                dlq = getattr(sub, "dead_letter_message_count", 0)
+                scheduled = getattr(sub, "scheduled_message_count", 0)
+                accessed_at = getattr(sub, "accessed_at_utc", None)
                 
                 subscriptions.append({
                     "name": sub.name,
                     "active": active,
                     "dlq": dlq,
                     "scheduled": scheduled,
-                    "status": getattr(sub, "status", "Unknown"),
-                    "forward_to": getattr(sub, "forward_to", None)
+                    "accessed_at": accessed_at
                 })
     except Exception as exc:
         print(f"\n[Error] Failed to auto-discover subscriptions: {exc}", file=sys.stderr)
@@ -825,13 +823,16 @@ def discover_and_select_subscription(args):
         name_padded = sub["name"].ljust(max_name_len)
         base_info = f"  [{idx:2d}] {name_padded}   (Active: {sub['active']:>7,}, DLQ: {sub['dlq']:>5,})"
         extras = []
+        
+        accessed_at = sub["accessed_at"]
+        if accessed_at and accessed_at.year > 1:
+            age_seconds = calculate_age_seconds(accessed_at)
+            extras.append(f"Last active: {format_age(age_seconds)} ago")
+        else:
+            extras.append("Last active: Never")
+
         if sub["scheduled"] > 0:
             extras.append(f"Scheduled: {sub['scheduled']:,}")
-        if str(sub["status"]) != "Active":
-            extras.append(f"Status: {sub['status']}")
-        if sub["forward_to"]:
-            target = sub["forward_to"].rstrip('/').split('/')[-1]
-            extras.append(f"Forwards to: {target}")
             
         if extras:
             print(f"{base_info}   [{' | '.join(extras)}]")
@@ -955,9 +956,6 @@ def next_peek_sequence_number(batch, current):
     last = getattr(batch[-1], "sequence_number", None)
     return last + 1 if last is not None else current
 
-def get_message_id(message):
-    return str(getattr(message, "message_id", "") or "")
-
 def release_pending_message(receiver, message, pending_messages):
     if abandon_message(receiver, message) and message in pending_messages:
         pending_messages.remove(message)
@@ -985,7 +983,7 @@ class ProgressReporter:
         self.last_print = elapsed
 
 def fetch_messages(client, args, use_peek_lock):
-    messages, seen_sequences, pending_messages = [], set(), []
+    messages, pending_messages = [], []
     receiver = None
     sequence_number = None
     start = time.monotonic()
@@ -1079,18 +1077,12 @@ def fetch_messages(client, args, use_peek_lock):
                     stop_reason = "message limit reached"
                     break
                 try:
-                    seq = getattr(message, "sequence_number", None)
-                    identity = (("sequence", seq) if seq is not None else
-                                ("id", get_message_id(message)) if get_message_id(message) else
-                                ("object", id(message)))
-                    if identity not in seen_sequences:
-                        seen_sequences.add(identity)
-                        observed_second = now - start
-                        result = process_message(message)
-                        result["observed_second"] = observed_second
-                        result["captured_at"] = captured_at
-                        messages.append(result)
-                        progress.update(result, len(messages), time.monotonic() - start)
+                    observed_second = now - start
+                    result = process_message(message)
+                    result["observed_second"] = observed_second
+                    result["captured_at"] = captured_at
+                    messages.append(result)
+                    progress.update(result, len(messages), time.monotonic() - start)
                 except KeyboardInterrupt:
                     stop_reason = "interrupted"
                     break
@@ -1111,6 +1103,7 @@ def fetch_messages(client, args, use_peek_lock):
                 receiver.close()
         except Exception:
             logger.exception("Error closing receiver")
+        
         if messages:
             progress.update(messages[-1], len(messages), time.monotonic() - start, force=True)
         print()
@@ -1121,7 +1114,7 @@ def parse_args():
     parser.add_argument("-n", "--namespace", required=True, help="Service Bus namespace")
     parser.add_argument("-s", "--subscription", dest="subscription_name", default=None, help="Subscription name (auto-discovered if omitted)")
     parser.add_argument("-t", "--topic", dest="topic_name", default="mysiteevents", help="Service Bus topic name")
-    parser.add_argument("-p", "--shared-access-policy-name", default="test", help="SAS policy name")
+    parser.add_argument("-p", "--shared-access-policy-name", default="Test", help="SAS policy name (default: Test)")
     parser.add_argument("-k", "--shared-access-policy-key", help="SAS policy key")
     parser.add_argument("--aad-username", help="Azure AD username")
     parser.add_argument("-m", "--size", dest="sample_size", type=int, default=None, help="Maximum messages (default: 100 if --duration is omitted)")
