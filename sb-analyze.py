@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict, Counter
 from datetime import datetime, timezone, timedelta
 
-VERSION = "2.5.0"
+VERSION = "2.5.2"
 DEFAULT_KEY_WIDTH = 80
 DEFAULT_COUNT_WIDTH = 7
 DEFAULT_PROGRESS_WIDTH = 95
@@ -122,7 +122,7 @@ def find_cache_key_in_json(value):
         preferred_names = ("cacheKey", "cache_key", "CacheKey", "key", "Key", "cachekey")
         for name in preferred_names:
             if name in value and isinstance(value[name], str):
-                return value[name]
+                return [value[name]]
         for child in value.values():
             result = find_cache_key_in_json(child)
             if result:
@@ -132,50 +132,63 @@ def find_cache_key_in_json(value):
             result = find_cache_key_in_json(child)
             if result:
                 return result
-    return None
+    return []
 
 def handle_json_message(body_bytes):
     try:
         text = body_bytes.decode("utf-8", errors="strict")
         data = json.loads(text)
-        value = find_cache_key_in_json(data)
-        if value:
-            return {"format": "JSON", "extracted_value": value}
-        return {"format": "JSON", "extracted_value": "[No cache key in JSON]"}
+        values = find_cache_key_in_json(data)
+        if values:
+            return [{"format": "JSON", "extracted_value": val} for val in values]
+        return [{"format": "JSON", "extracted_value": "[No cache key in JSON]"}]
     except Exception:
-        return {"format": "JSON", "extracted_value": "[Invalid JSON]"}
+        return [{"format": "JSON", "extracted_value": "[Invalid JSON]"}]
 
 def find_cache_key_in_xml(element):
+    # Check for Optimizely CacheChangedEventArgs structure
+    tag_lower = local_xml_name(element.tag).lower()
+    if "cachechangedeventargs" in tag_lower:
+        action = "Unknown"
+        items = []
+        for child in element:
+            c_tag = local_xml_name(child.tag).lower()
+            if "typeofeventaction" in c_tag and child.text:
+                action = child.text.strip()
+            elif "itemstoprocess" in c_tag:
+                for sub in child:
+                    if sub.text and sub.text.strip():
+                        items.append(sub.text.strip())
+        if items:
+            return [f"CacheChangedEventArgs_{action}_{item}" for item in items]
+        return [f"CacheChangedEventArgs_{action}_[No items]"]
+
     preferred_names = {"cachekey", "cache_key", "key", "cache", "cacheid", "cacheidentifier"}
-    tag_name = element.tag
-    if isinstance(tag_name, str):
-        if "}" in tag_name:
-            tag_name = tag_name.rsplit("}", 1)[1]
-        if tag_name.lower() in preferred_names:
-            if element.text and element.text.strip():
-                return element.text.strip()
+    if tag_lower in preferred_names:
+        if element.text and element.text.strip():
+            return [element.text.strip()]
+            
     for name, value in element.attrib.items():
-        attribute_name = name
-        if "}" in attribute_name:
-            attribute_name = attribute_name.rsplit("}", 1)[1]
-        if attribute_name.lower() in preferred_names:
+        attribute_name = local_xml_name(name).lower()
+        if attribute_name in preferred_names:
             if value:
-                return value
+                return [value]
+                
     for child in element:
         result = find_cache_key_in_xml(child)
         if result:
             return result
-    return None
+    return []
 
 def handle_xml_message(body_bytes):
     try:
         root = ET.fromstring(body_bytes)
-        value = find_cache_key_in_xml(root)
-        if value:
-            return {"format": "XML", "extracted_value": value}
-        return {"format": "XML", "extracted_value": "[No cache key in XML]"}
+        values = find_cache_key_in_xml(root)
+        if values:
+            return [{"format": "XML", "extracted_value": val} for val in values]
+        return [{"format": "XML", "extracted_value": "[No cache key in XML]"}]
     except Exception:
-        return {"format": "XML", "extracted_value": "[Invalid XML]"}
+        return [{"format": "XML", "extracted_value": "[Invalid XML]"}]
 
 WCF_FORMAT = "WCF Binary XML"
 
@@ -347,53 +360,65 @@ def extract_embedded_json(parameter, rule):
             continue
         value = nested_json_value(payload, rule["field"])
         if value:
-            return value.split(",", 1)[0].strip() if rule.get("strip_assembly") else value
+            return [value.split(",", 1)[0].strip() if rule.get("strip_assembly") else value]
         value = nested_json_value(payload, rule["fallback_field"])
         if value:
-            return value
-    return None
+            return [value]
+    return []
 
 def extract_xml_child(parameter, field):
     for child in parameter.iter():
         if child is not parameter and local_xml_name(child.tag) == field:
-            return (child.text or "").strip() or None
-    return None
+            if child.text and child.text.strip():
+                return [child.text.strip()]
+    return []
 
 def extract_wcf_parameter(parameter):
+    # Check if parameter contains CacheChangedEventArgs directly
+    cache_values = find_cache_key_in_xml(parameter)
+    if cache_values:
+        return "CacheChangedEventArgs", cache_values
+
     parameter_type = get_parameter_type(parameter)
-    rule = MESSAGE_EXTRACTORS.get(get_parameter_type_name(parameter_type))
+    type_name = get_parameter_type_name(parameter_type)
+    rule = MESSAGE_EXTRACTORS.get(type_name)
+    
     if rule is None:
-        return "OtherParameter", parameter_type or "[Parameter has no type]"
+        return "OtherParameter", [parameter_type or "[Parameter has no type]"]
+        
     strategy = rule["strategy"]
     if strategy == "text":
-        value = (parameter.text or "").strip()
+        val = (parameter.text or "").strip()
+        values = [val] if val else []
     elif strategy == "base64":
-        value = decode_base64_parameter((parameter.text or "").strip())
+        val = decode_base64_parameter((parameter.text or "").strip())
+        values = [val] if val else []
     elif strategy == "embedded_json":
-        value = extract_embedded_json(parameter, rule)
+        values = extract_embedded_json(parameter, rule)
     elif strategy == "xml_child":
-        child_value = extract_xml_child(parameter, field=rule["field"])
-        value = rule.get("prefix", "") + child_value if child_value else None
+        child_vals = extract_xml_child(parameter, field=rule["field"])
+        values = [rule.get("prefix", "") + v for v in child_vals] if child_vals else []
     else:
         raise ValueError(f"Unsupported extraction strategy: {strategy}")
-    return rule["label"], value or rule["fallback"]
+        
+    return rule["label"], values or [rule["fallback"]]
 
 def handle_wcf_binary_message(body_bytes):
     try:
         xml_text = decode_wcf_xml(body_bytes)
         root = parse_wcf_xml(xml_text)
     except Exception:
-        return {"format": "Unknown Binary", "extracted_value": "[Unrecognized binary format]"}
+        return [{"format": "Unknown Binary", "extracted_value": "[Unrecognized binary format]"}]
     if root is None:
-        return {"format": "Unknown Binary", "extracted_value": "[Invalid decoded XML]"}
+        return [{"format": "Unknown Binary", "extracted_value": "[Invalid decoded XML]"}]
     parameter = find_wcf_parameter(root)
     if parameter is None:
-        return {"format": WCF_FORMAT, "extracted_value": "Unknown WCF Event"}
+        return [{"format": WCF_FORMAT, "extracted_value": "Unknown WCF Event"}]
     try:
-        kind, value = extract_wcf_parameter(parameter)
-        return {"format": WCF_FORMAT, "extracted_value": value, "value_kind": kind}
+        kind, values = extract_wcf_parameter(parameter)
+        return [{"format": WCF_FORMAT, "extracted_value": val, "value_kind": kind} for val in values]
     except Exception:
-        return {"format": WCF_FORMAT, "extracted_value": "[Extraction error]", "value_kind": "OtherParameter"}
+        return [{"format": WCF_FORMAT, "extracted_value": "[Extraction error]", "value_kind": "OtherParameter"}]
 
 def detect_format(body_bytes):
     if not body_bytes:
@@ -410,7 +435,7 @@ def detect_format(body_bytes):
 def handle_message_body(body_bytes):
     message_format = detect_format(body_bytes)
     if message_format == "empty":
-        return {"format": "Empty", "extracted_value": "[Empty message body]"}
+        return [{"format": "Empty", "extracted_value": "[Empty message body]"}]
     if message_format == "json":
         return handle_json_message(body_bytes)
     if message_format == "xml":
@@ -419,12 +444,19 @@ def handle_message_body(body_bytes):
 
 def process_message(message):
     body_bytes = get_message_body_bytes(message)
-    result = handle_message_body(body_bytes)
-    result["message_id"] = str(getattr(message, "message_id", "") or "")
-    result["sequence_number"] = getattr(message, "sequence_number", None)
-    result["enqueued_time"] = getattr(message, "enqueued_time_utc", None)
-    result["body_size"] = len(body_bytes)
-    return result
+    results = handle_message_body(body_bytes)
+    
+    # If a single message yields multiple values (e.g. CacheChangedEventArgs batch), 
+    # we return them so each gets represented.
+    processed_list = []
+    for res in results:
+        item = dict(res)
+        item["message_id"] = str(getattr(message, "message_id", "") or "")
+        item["sequence_number"] = getattr(message, "sequence_number", None)
+        item["enqueued_time"] = getattr(message, "enqueued_time_utc", None)
+        item["body_size"] = len(body_bytes)
+        processed_list.append(item)
+    return processed_list
 
 # ---------------------------------------------------------------------------
 # Type-Aware Structural Grouping
@@ -494,7 +526,7 @@ def split_key_structure(value):
     return parts
 
 def discover_patterns(exact_groups, pattern_term_min_count=5, show_progress=True):
-    string_entries = [(v, len(msgs)) for (kind, v), msgs in exact_groups.items() if kind == "String"]
+    string_entries = [(v, len(msgs)) for (kind, v), msgs in exact_groups.items() if kind in ("String", "CacheChangedEventArgs")]
     if not string_entries:
         return []
 
@@ -598,12 +630,13 @@ def build_pattern_group_results(exact_groups, patterns):
         messages = []
         for value in available_values:
             messages.extend(exact_groups.get(("String", value), []))
+            messages.extend(exact_groups.get(("CacheChangedEventArgs", value), []))
             
         represented_values.update(available_values)
         groups.append(message_group_result(pattern["pattern"], messages, "String"))
 
     for (kind, value), messages in exact_groups.items():
-        if kind == "String" and value in represented_values:
+        if kind in ("String", "CacheChangedEventArgs") and value in represented_values:
             continue
         groups.append(message_group_result(value, messages, kind))
 
@@ -646,7 +679,7 @@ def build_analysis_report(groups, total_messages, min_pct=1.0, top=10, full_valu
     key_width = max(DEFAULT_KEY_WIDTH, *(len(str(g["key"])) for g in displayed)) if full_values else DEFAULT_KEY_WIDTH
     pct_width = 13
     age_width = 10
-    kind_width = 19
+    kind_width = 23
     
     header = f"{'Count':>{DEFAULT_COUNT_WIDTH}} | {'% of messages':>{pct_width}} | {'Source':<{kind_width}} | {'Value / Pattern':<{key_width}} | {'Avg age':>{age_width}}"
     divider = f"{'-'*DEFAULT_COUNT_WIDTH}-+-{'-'*pct_width}-+-{'-'*kind_width}-+-{'-'*key_width}-+-{'-'*age_width}"
@@ -715,11 +748,11 @@ def build_throughput_report(messages, groups, elapsed, top, full_values=False):
 
     displayed = groups if top <= 0 else groups[:top]
     actual_key_width = max(DEFAULT_KEY_WIDTH, *(len(str(g["key"])) for g in displayed)) if (full_values and displayed) else DEFAULT_KEY_WIDTH
-    per_source_divider_len = 10 + 3 + 11 + 3 + 11 + 3 + 19 + 3 + actual_key_width
+    per_source_divider_len = 10 + 3 + 11 + 3 + 11 + 3 + 23 + 3 + actual_key_width
 
     lines += [
         "", "Per source / value (sampled enqueue-time rates)",
-        f"{'Count':>10} | {'Avg msg/s':>11} | {'Peak msg/s':>11} | {'Source':<19} | Value / Pattern",
+        f"{'Count':>10} | {'Avg msg/s':>11} | {'Peak msg/s':>11} | {'Source':<23} | Value / Pattern",
         "-" * per_source_divider_len
     ]
     for group in displayed:
@@ -728,7 +761,7 @@ def build_throughput_report(messages, groups, elapsed, top, full_values=False):
         group_peak = max(group_seconds.values(), default=0)
         lines.append(
             f"{len(group_times):>10,} | {len(group_times)/span:>11.2f} | "
-            f"{group_peak:>11,} | {truncate_text(group['kind'], 19):<19} | "
+            f"{group_peak:>11,} | {truncate_text(group['kind'], 23):<23} | "
             f"{str(group['key']) if full_values else truncate_text(group['key'], actual_key_width)}"
         )
     lines += [
@@ -921,22 +954,6 @@ def abandon_message(receiver, message):
         logger.debug("Unable to abandon message during cleanup: %s", exc)
         return False
 
-def abandon_pending_messages(receiver, pending_messages):
-    if not pending_messages:
-        return
-    print(f"\nAbandoning {len(pending_messages)} outstanding message(s)...")
-    previous_sigint = None
-    if threading.current_thread() is threading.main_thread():
-        previous_sigint = signal.getsignal(signal.SIGINT)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-    try:
-        for message in list(pending_messages):
-            abandon_message(receiver, message)
-        pending_messages.clear()
-    finally:
-        if previous_sigint is not None:
-            signal.signal(signal.SIGINT, previous_sigint)
-
 def create_subscription_receiver(client, args):
     return client.get_subscription_receiver(
         topic_name=args.topic_name,
@@ -980,7 +997,7 @@ class ProgressReporter:
         self.last_print = elapsed
 
 def fetch_messages(client, args, use_peek_lock):
-    messages, pending_messages = [], []
+    messages = []
     receiver = None
     sequence_number = None
     start = time.monotonic()
@@ -1040,8 +1057,6 @@ def fetch_messages(client, args, use_peek_lock):
                     next_outage_notice = now + 60
 
                 if receiver is not None:
-                    if use_peek_lock and pending_messages:
-                        abandon_pending_messages(receiver, pending_messages)
                     try:
                         receiver.close()
                     except Exception:
@@ -1065,9 +1080,7 @@ def fetch_messages(client, args, use_peek_lock):
                     time.sleep(min(0.5, max(0, deadline - time.monotonic())) if deadline else 0.5)
                 continue
 
-            if use_peek_lock:
-                pending_messages.extend(batch)
-            else:
+            if not use_peek_lock:
                 sequence_number = next_peek_sequence_number(batch, sequence_number)
 
             batch_duplicates = 0
@@ -1076,6 +1089,7 @@ def fetch_messages(client, args, use_peek_lock):
             for message in batch:
                 seq_num = getattr(message, "sequence_number", None)
                 
+                # In-memory deduplication check
                 if seq_num is not None and seq_num in seen_sequence_numbers:
                     duplicate_count += 1
                     batch_duplicates += 1
@@ -1083,42 +1097,40 @@ def fetch_messages(client, args, use_peek_lock):
                         abandon_message(receiver, message)
                     continue
 
-                batch_unique += 1
-                now = time.monotonic()
-                captured_at = utc_now()
-                if deadline is not None and now >= deadline:
-                    stop_reason = "duration reached"
-                    break
-                if args.sample_size is not None and len(messages) >= args.sample_size:
-                    stop_reason = "message limit reached"
-                    break
                 try:
+                    results = process_message(message)
+                except Exception:
+                    logger.exception("Error processing message body")
+                    if use_peek_lock:
+                        abandon_message(receiver, message)
+                    continue
+
+                for result in results:
+                    now = time.monotonic()
+                    captured_at = utc_now()
+                    if deadline is not None and now >= deadline:
+                        stop_reason = "duration reached"
+                        break
+                    if args.sample_size is not None and len(messages) >= args.sample_size:
+                        stop_reason = "message limit reached"
+                        break
+
                     observed_second = now - start
-                    result = process_message(message)
                     result["observed_second"] = observed_second
                     result["captured_at"] = captured_at
                     messages.append(result)
-                    
-                    if seq_num is not None:
-                        seen_sequence_numbers.add(seq_num)
+                    batch_unique += 1
 
                     progress.update(result, len(messages), time.monotonic() - start)
-                except KeyboardInterrupt:
-                    stop_reason = "interrupted"
-                    break
-                except Exception:
-                    logger.exception("Error processing message")
-                finally:
-                    if use_peek_lock:
-                        try:
-                            receiver.abandon_message(message)
-                        except Exception as exc:
-                            logger.debug("Unable to abandon message during analysis: %s", exc)
+
+                if use_peek_lock:
+                    abandon_message(receiver, message)
+
+                if seq_num is not None:
+                    seen_sequence_numbers.add(seq_num)
 
             # Adaptive Breathing Room for Peek-Lock:
-            # If a batch contained mostly duplicates or was empty of fresh work, take a short breath
-            # to avoid racing or locking out real production consumers.
-            if use_peek_lock and (batch_unique == 0 or (batch_duplicates / len(batch)) > 0.1):
+            if use_peek_lock and (batch_unique == 0 or (batch_duplicates / max(1, len(batch))) > 0.1):
                 time.sleep(args.pace_delay)
 
             if stop_reason != "unknown":
@@ -1126,8 +1138,6 @@ def fetch_messages(client, args, use_peek_lock):
     except KeyboardInterrupt:
         stop_reason = "interrupted"
     finally:
-        if use_peek_lock and receiver is not None:
-            abandon_pending_messages(receiver, pending_messages)
         try:
             if receiver is not None:
                 receiver.close()
@@ -1153,7 +1163,6 @@ def parse_args():
     parser.add_argument("--top", type=int, default=10, help="Maximum groups to display (default: 10; 0 = unlimited)")
     parser.add_argument("--min-pct", type=float, default=1.0, help="Minimum percentage of analyzed messages to display (default: 1.0; 0 = disabled)")
     
-    # Mode selection flags
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--auto", action="store_true", default=True, help="Automatically choose Peek or Peek-Lock based on queue activity (default)")
     mode_group.add_argument("--peek", action="store_true", help="Force non-destructive Peek mode")
