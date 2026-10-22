@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict, Counter
 from datetime import datetime, timezone, timedelta
 
-VERSION = "2.4.1"
+VERSION = "2.5.0"
 DEFAULT_KEY_WIDTH = 80
 DEFAULT_COUNT_WIDTH = 7
 DEFAULT_PROGRESS_WIDTH = 95
@@ -737,13 +737,14 @@ def build_throughput_report(messages, groups, elapsed, top, full_values=False):
     ]
     return "\n".join(lines)
 
-def write_output_file(filename, report, collection_started, collection_ended, elapsed, args, message_count, stop_reason):
+def write_output_file(filename, report, collection_started, collection_ended, elapsed, args, message_count, duplicate_count, mode_used, stop_reason):
     lines = [
         f"Namespace: {normalize_namespace(args.namespace)}",
         f"Topic: {args.topic_name}",
         f"Subscription: {args.subscription_name}",
-        f"Mode: {'Peek' if args.peek else 'Peek-Lock'}",
+        f"Mode: {mode_used}",
         f"Messages analyzed: {message_count}",
+        f"Duplicate/re-read messages ignored: {duplicate_count}",
         f"Duration limit (minutes): {args.duration if args.duration is not None else 'none'}",
         f"Message limit: {args.sample_size if args.sample_size is not None else 'none'}",
         f"Stop reason: {stop_reason}",
@@ -814,7 +815,7 @@ def discover_and_select_subscription(args):
         selected = subscriptions[0]
         print(f"Auto-selected sole subscription: {selected['name']}")
         print(f"(Active: {selected['active']:,} | DLQ: {selected['dlq']:,})\n")
-        return selected["name"]
+        return selected["name"], selected["active"]
 
     print(f"\nAvailable subscriptions for topic '{args.topic_name}':")
     max_name_len = max((len(s["name"]) for s in subscriptions), default=0)
@@ -850,9 +851,9 @@ def discover_and_select_subscription(args):
             if choice.isdigit():
                 num = int(choice)
                 if 1 <= num <= len(subscriptions):
-                    selected = subscriptions[num - 1]["name"]
-                    print(f"Selected: {selected}\n")
-                    return selected
+                    chosen_sub = subscriptions[num - 1]
+                    print(f"Selected: {chosen_sub['name']}\n")
+                    return chosen_sub["name"], chosen_sub["active"]
             print(f"Invalid choice. Please enter a number between 1 and {len(subscriptions)}.")
         except (KeyboardInterrupt, EOFError):
             print("\nOperation cancelled by user.")
@@ -956,10 +957,6 @@ def next_peek_sequence_number(batch, current):
     last = getattr(batch[-1], "sequence_number", None)
     return last + 1 if last is not None else current
 
-def release_pending_message(receiver, message, pending_messages):
-    if abandon_message(receiver, message) and message in pending_messages:
-        pending_messages.remove(message)
-
 class ProgressReporter:
     def __init__(self, args, interval=0.5):
         self.args = args
@@ -993,6 +990,10 @@ def fetch_messages(client, args, use_peek_lock):
     consecutive_errors = 0
     outage_started = None
     next_outage_notice = None
+
+    seen_sequence_numbers = set()
+    duplicate_count = 0
+
     try:
         while True:
             now = time.monotonic()
@@ -1063,11 +1064,26 @@ def fetch_messages(client, args, use_peek_lock):
                 if not use_peek_lock:
                     time.sleep(min(0.5, max(0, deadline - time.monotonic())) if deadline else 0.5)
                 continue
+
             if use_peek_lock:
                 pending_messages.extend(batch)
             else:
                 sequence_number = next_peek_sequence_number(batch, sequence_number)
+
+            batch_duplicates = 0
+            batch_unique = 0
+
             for message in batch:
+                seq_num = getattr(message, "sequence_number", None)
+                
+                if seq_num is not None and seq_num in seen_sequence_numbers:
+                    duplicate_count += 1
+                    batch_duplicates += 1
+                    if use_peek_lock:
+                        abandon_message(receiver, message)
+                    continue
+
+                batch_unique += 1
                 now = time.monotonic()
                 captured_at = utc_now()
                 if deadline is not None and now >= deadline:
@@ -1082,6 +1098,10 @@ def fetch_messages(client, args, use_peek_lock):
                     result["observed_second"] = observed_second
                     result["captured_at"] = captured_at
                     messages.append(result)
+                    
+                    if seq_num is not None:
+                        seen_sequence_numbers.add(seq_num)
+
                     progress.update(result, len(messages), time.monotonic() - start)
                 except KeyboardInterrupt:
                     stop_reason = "interrupted"
@@ -1090,7 +1110,17 @@ def fetch_messages(client, args, use_peek_lock):
                     logger.exception("Error processing message")
                 finally:
                     if use_peek_lock:
-                        release_pending_message(receiver, message, pending_messages)
+                        try:
+                            receiver.abandon_message(message)
+                        except Exception as exc:
+                            logger.debug("Unable to abandon message during analysis: %s", exc)
+
+            # Adaptive Breathing Room for Peek-Lock:
+            # If a batch contained mostly duplicates or was empty of fresh work, take a short breath
+            # to avoid racing or locking out real production consumers.
+            if use_peek_lock and (batch_unique == 0 or (batch_duplicates / len(batch)) > 0.1):
+                time.sleep(args.pace_delay)
+
             if stop_reason != "unknown":
                 break
     except KeyboardInterrupt:
@@ -1107,7 +1137,7 @@ def fetch_messages(client, args, use_peek_lock):
         if messages:
             progress.update(messages[-1], len(messages), time.monotonic() - start, force=True)
         print()
-    return messages, time.monotonic() - start, stop_reason
+    return messages, time.monotonic() - start, stop_reason, duplicate_count
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Analyze Azure Service Bus cache invalidation messages.")
@@ -1122,8 +1152,15 @@ def parse_args():
     parser.add_argument("-o", "--output", help="Write the final analysis report to a file")
     parser.add_argument("--top", type=int, default=10, help="Maximum groups to display (default: 10; 0 = unlimited)")
     parser.add_argument("--min-pct", type=float, default=1.0, help="Minimum percentage of analyzed messages to display (default: 1.0; 0 = disabled)")
-    parser.add_argument("--peek", action="store_true", help="Use Peek instead of Peek-Lock")
+    
+    # Mode selection flags
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--auto", action="store_true", default=True, help="Automatically choose Peek or Peek-Lock based on queue activity (default)")
+    mode_group.add_argument("--peek", action="store_true", help="Force non-destructive Peek mode")
+    mode_group.add_argument("--peek-lock", action="store_true", help="Force Peek-Lock mode")
+
     parser.add_argument("-w", "--wait", dest="wait_time", type=float, default=5.0, help="Receive wait time in seconds (default: 5.0)")
+    parser.add_argument("--pace-delay", type=float, default=0.5, help="Breathing pause delay in seconds when Peek-Lock hits heavy duplicates (default: 0.5)")
     parser.add_argument("--no-pattern-grouping", action="store_true", help="Disable pattern grouping")
     parser.add_argument("--pattern-term-min-count", type=int, default=5, help="Minimum distinct text terms required to collapse a text slot (default: 5)")
     parser.add_argument("--debug", action="store_true", help="Show debug logging")
@@ -1135,6 +1172,8 @@ def parse_args():
         parser.error("--size must be positive")
     if args.wait_time <= 0:
         parser.error("--wait must be positive")
+    if args.pace_delay < 0:
+        parser.error("--pace-delay must be non-negative")
     if args.sample_size is None and args.duration is None:
         args.sample_size = 100
     return args
@@ -1147,19 +1186,43 @@ def main():
     )
     ensure_dependencies()
 
+    active_message_count = 0
     if args.subscription_name is None:
-        args.subscription_name = discover_and_select_subscription(args)
+        args.subscription_name, active_message_count = discover_and_select_subscription(args)
+    else:
+        try:
+            admin_client = get_servicebus_admin_client(args)
+            with admin_client:
+                props = admin_client.get_subscription_runtime_properties(topic_name=args.topic_name, subscription_name=args.subscription_name)
+                active_message_count = getattr(props, "active_message_count", 0)
+        except Exception:
+            active_message_count = 0
+
+    if args.peek:
+        use_peek_lock = False
+        mode_used = "Peek (Forced)"
+    elif args.peek_lock:
+        use_peek_lock = True
+        mode_used = "Peek-Lock (Forced)"
+    else:
+        if active_message_count > 100:
+            use_peek_lock = False
+            mode_used = f"Peek (Auto-selected: queue has {active_message_count:,} active messages)"
+        else:
+            use_peek_lock = True
+            mode_used = f"Peek-Lock (Auto-selected: queue has {active_message_count:,} active messages)"
 
     collection_started = utc_now()
     print(f"Namespace: {normalize_namespace(args.namespace)}")
     print(f"Topic: {args.topic_name}")
     print(f"Subscription: {args.subscription_name}")
-    print(f"Mode: {'Peek' if args.peek else 'Peek-Lock'}\n")
+    print(f"Mode: {mode_used}\n")
+
     client = None
     try:
         client = get_servicebus_client(args)
-        messages, collection_elapsed, stop_reason = fetch_messages(
-            client, args, use_peek_lock=not args.peek
+        messages, collection_elapsed, stop_reason, duplicate_count = fetch_messages(
+            client, args, use_peek_lock=use_peek_lock
         )
         groups = group_messages(
             messages,
@@ -1168,7 +1231,7 @@ def main():
         )
         capture_rate = len(messages) / collection_elapsed if collection_elapsed > 0 else 0.0
         capture_section = (f"Analyzer capture rate: {capture_rate:.2f} messages/s "
-                           f"({len(messages):,} unique messages / {format_elapsed(collection_elapsed)} collection time)\n"
+                           f"({len(messages):,} unique messages analyzed, {duplicate_count:,} duplicate/re-read messages ignored / {format_elapsed(collection_elapsed)} collection time)\n"
                            "Capture rate is not the subscription's arrival rate or the competing consumer's processing rate.")
         report = (build_analysis_report(groups, len(messages), args.min_pct, args.top)
                   + "\n\n" + build_throughput_report(messages, groups, collection_elapsed, args.top)
@@ -1177,6 +1240,7 @@ def main():
                        + "\n\n" + build_throughput_report(messages, groups, collection_elapsed, args.top, full_values=True)
                        + "\n\n" + capture_section)
         print(f"Stop reason: {stop_reason}")
+        print(f"Duplicates intercepted / re-reads skipped: {duplicate_count:,}")
         print()
         print(report)
     except InitialCollectionError as exc:
@@ -1200,6 +1264,7 @@ def main():
     print(f"Collection started:    {format_timestamp(collection_started)} UTC")
     print(f"Collection ended:      {format_timestamp(collection_ended)} UTC")
     print(f"Collection time:       {format_elapsed(elapsed)}")
+    print(f"Duplicates ignored:    {duplicate_count:,}")
     if args.output:
         try:
             write_output_file(
@@ -1210,6 +1275,8 @@ def main():
                 elapsed,
                 args,
                 len(messages),
+                duplicate_count,
+                mode_used,
                 stop_reason,
             )
         except OSError as exc:
